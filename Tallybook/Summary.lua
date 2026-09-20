@@ -16,20 +16,43 @@ ns.Summary = Summary
 local VISIBLE, ROW_H = 20, 18 -- rows on screen, and the height of one
 local TOP = 88                -- where the rows start, below the title, counts, toggles and column headers
 local WHEEL = 3               -- rows per notch of the mouse wheel
--- columns: key, header text, left edge, width, alignment
+local CRAFTS = { 1, 5, 10, 20, 50, 100 } -- what the "crafts" button cycles through, for a right-click basket
+-- columns: sort key, header text, left edge, width, alignment, the row's field for it
 local COLUMNS = {
-    { "name", "Recipe", 12, 190, "LEFT" },
-    { "cost", "Cost", 206, 84, "RIGHT" },
-    { "sale", "Sells for", 294, 84, "RIGHT" },
-    { "profit", "Profit / Loss", 382, 124, "RIGHT" },
+    { "name", "Recipe", 12, 190, "LEFT", "name" },
+    { "cost", "Cost", 206, 84, "RIGHT", "cost" },
+    { "sale", "Sells for", 294, 84, "RIGHT", "sale" },
+    { "listed", "Listed", 382, 56, "RIGHT", "listed" },
+    { "profit", "Profit / Loss", 442, 124, "RIGHT", "result" },
 }
-local WIDTH = 518
+local WIDTH = 578
 -- The profession tabs hang off the window's right edge (about 45 wide on this client): the panel starts past them.
 local CLEAR_OF_TABS = 52
 local GREEN, RED, GREY, CLOSE = "|cff00ff00", "|cffff2020", "|cff808080", "|r"
 
-local state = { key = "profit", descending = true, knownOnly = true, hideUnknown = false, offset = 0 }
+-- The player's choices live in the settings (ns.settings: saved, else baked at the last install, else default);
+-- state is this session's working copy, read once and written back on every change.
+local state
 local panel, cannotBuild
+
+local function choices()
+    if not state then
+        local s = ns.settings()
+        state = { key = s.sortKey, descending = s.sortDesc, knownOnly = s.knownOnly, hideUnknown = s.hideUnknown,
+            offset = 0 }
+    end
+    return state
+end
+
+local crafts = 2 -- index into CRAFTS: 5 to start with
+
+local function remember()
+    ns.setSetting("list", ns.settings().list)
+    ns.setSetting("sortKey", state.key)
+    ns.setSetting("sortDesc", state.descending)
+    ns.setSetting("knownOnly", state.knownOnly)
+    ns.setSetting("hideUnknown", state.hideUnknown)
+end
 local current, counts = {}, { profit = 0, loss = 0, unknown = 0 }
 
 local function window()
@@ -78,6 +101,7 @@ end
 
 -- The open profession's recipes -> current (filtered, named, sorted) and counts (before "hide unknown").
 local function compute()
+    choices()
     current, counts = {}, { profit = 0, loss = 0, unknown = 0 }
     local T, db = C_TradeSkillUI, TallybookDB
     if type(T) ~= "table" or type(T.GetAllRecipeIDs) ~= "function" or type(db) ~= "table" then return end
@@ -102,7 +126,7 @@ local function compute()
 
     local index, outputs = Logic.recipeIndex(db.recipes)
     local rows
-    rows, counts = Logic.profitSummary(wanted, index, outputs, db.prices, db.vendor)
+    rows, counts = Logic.profitSummary(wanted, index, outputs, db.prices, db.vendor, db.listed)
     for i = 1, #rows do
         local row = rows[i]
         row.name = names[row.recipeID] or ns.UI.itemName(row.itemID)
@@ -196,6 +220,7 @@ local function paint()
             row.name:SetText(data.name)
             row.cost:SetText(costText(data))
             row.sale:SetText(data.sale and ns.UI.money(data.sale) or "-")
+            row.listed:SetText(data.listed and string.format("%.0f", data.listed) or "-")
             row.result:SetText(resultText(data))
             row:Show()
         else
@@ -207,7 +232,12 @@ end
 local function build(parent)
     local p = CreateFrame("Frame", nil, parent)
     p:SetSize(WIDTH, TOP + VISIBLE * ROW_H + 10)
-    p:SetPoint("TOPLEFT", parent, "TOPRIGHT", CLEAR_OF_TABS, -56)
+    local at = ns.settings().panel -- where it was dragged to, if it ever was
+    if at and type(UIParent) == "table" then
+        p:SetPoint(at[1], UIParent, at[2], at[3], at[4])
+    else
+        p:SetPoint("TOPLEFT", parent, "TOPRIGHT", CLEAR_OF_TABS, -56)
+    end
     -- Readable whatever is behind it: a solid background, and above the quest tracker, meters and action bars
     -- (tooltips and menus are higher still).
     p:SetFrameStrata("HIGH")
@@ -232,12 +262,19 @@ local function build(parent)
     band:SetPoint("TOPRIGHT", p, "TOPRIGHT", -1, -1)
     band:SetHeight(TOP - 4)
 
-    -- Drag it anywhere with the left button. (Where it was is not remembered: saved data is not read back.)
+    -- Drag it anywhere with the left button; where it is dropped goes into the settings.
     p:SetMovable(true)
     p:SetClampedToScreen(true)
     p:RegisterForDrag("LeftButton")
     p:SetScript("OnDragStart", guarded(function(self) self:StartMoving() end))
-    p:SetScript("OnDragStop", guarded(function(self) self:StopMovingOrSizing() end))
+    p:SetScript("OnDragStop", guarded(function(self)
+        self:StopMovingOrSizing()
+        local point, _, relativePoint, x, y = self:GetPoint(1)
+        if point and type(x) == "number" and type(y) == "number" then
+            -- to the hundredth: what is saved is what the reference document and the baked file will say
+            ns.setSetting("panel", { point, relativePoint, math.floor(x * 100 + 0.5) / 100, math.floor(y * 100 + 0.5) / 100 })
+        end
+    end))
 
     p.title = newLabel(p, "GameFontNormal")
     p.title:SetPoint("TOPLEFT", p, "TOPLEFT", 12, -10)
@@ -248,15 +285,25 @@ local function build(parent)
     close:SetPoint("TOPRIGHT", p, "TOPRIGHT", -6, -6)
     setText(close, "x")
 
+    -- How many crafts a right-click on a row prices (the basket, board card F13).
+    p.craftsButton = textButton(p, 80, "RIGHT", function()
+        crafts = crafts % #CRAFTS + 1
+        setText(p.craftsButton, "crafts: " .. string.format("%.0f", CRAFTS[crafts]))
+    end)
+    p.craftsButton:SetPoint("TOPRIGHT", p, "TOPRIGHT", -34, -6)
+    setText(p.craftsButton, "crafts: " .. string.format("%.0f", CRAFTS[crafts]))
+
     p.knownToggle = textButton(p, 170, "LEFT", function()
         state.knownOnly = not state.knownOnly
         state.offset = 0
+        remember()
         Summary.refresh()
     end)
     p.knownToggle:SetPoint("TOPLEFT", p, "TOPLEFT", 12, -46)
     p.unknownToggle = textButton(p, 130, "LEFT", function()
         state.hideUnknown = not state.hideUnknown
         state.offset = 0
+        remember()
         Summary.refresh()
     end)
     p.unknownToggle:SetPoint("TOPLEFT", p, "TOPLEFT", 190, -46)
@@ -271,6 +318,7 @@ local function build(parent)
                 state.key, state.descending = key, key ~= "name" -- numbers start biggest first, names A to Z
             end
             state.offset = 0
+            remember()
             Summary.refresh()
         end)
         header:SetPoint("TOPLEFT", p, "TOPLEFT", left, -68)
@@ -291,13 +339,26 @@ local function build(parent)
         row.glow:SetAllPoints()
         row.glow:SetColorTexture(1, 0.82, 0, 0.14)
         row.glow:Hide()
-        local fields = { "name", "cost", "sale", "result" }
         for c = 1, #COLUMNS do
             local text = newLabel(row, "GameFontHighlightSmall", COLUMNS[c][5])
             text:SetWidth(COLUMNS[c][4])
             text:SetPoint("LEFT", row, "LEFT", COLUMNS[c][3], 0)
-            row[fields[c]] = text
+            row[COLUMNS[c][6]] = text
         end
+        -- Left click: show the recipe in the game's own window (the call behind recipe links in chat). It
+        -- selects; it never crafts - Create stays the player's own click. Right click: price a basket of it.
+        -- Either way it becomes the recipe "/tally basket N" means.
+        row:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+        row:SetScript("OnClick", guarded(function(self, button)
+            if not self.data then return end
+            Summary.chosen = { recipeID = self.data.recipeID, itemID = self.data.itemID, name = self.data.name }
+            if button == "RightButton" then
+                ns.Craft.basket(CRAFTS[crafts], Summary.chosen)
+                return
+            end
+            local T = C_TradeSkillUI
+            if type(T) == "table" and type(T.OpenRecipe) == "function" then pcall(T.OpenRecipe, self.data.recipeID) end
+        end))
         -- The item's own tooltip carries the full breakdown (UI.lua adds it to every item tooltip).
         row:SetScript("OnEnter", guarded(function(self)
             self.glow:Show()
@@ -368,7 +429,7 @@ function Summary.toggle()
         return
     end
     panel:SetShown(not panel:IsShown())
-    state.offset = 0
+    choices().offset = 0
     Summary.refresh()
 end
 

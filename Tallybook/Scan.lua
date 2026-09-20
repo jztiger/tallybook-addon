@@ -38,6 +38,8 @@ local current -- the running scan, or nil. A new table per scan, so stale timers
 local late    -- a full scan whose list had not arrived after REPLICATE_TIMEOUT. It no longer blocks
               -- anything, and sends nothing; it only says "a list that arrives now is still mine".
 
+local ladderNext -- defined with the price ladders further down; the throttle handler above them calls it
+
 function Scan.busy()
     return current ~= nil
 end
@@ -457,6 +459,7 @@ local function finishBrowse(run, complete, why)
     if complete then
         local db = ns.db()
         db.prices = Logic.priceTable(rows)
+        db.listed = Logic.listedTable(rows)
         db.pricesAt = t1
         ns.changed() -- the costs in an open profession window follow the new prices
     else
@@ -547,6 +550,7 @@ ns.on("AUCTION_HOUSE_BROWSE_RESULTS_ADDED", onBrowseResults)
 
 ns.on("AUCTION_HOUSE_THROTTLED_SYSTEM_READY", function()
     local run = current
+    if run and run.kind == "ladder" then return ladderNext(run) end
     if not run or run.kind ~= "browse" then return end
     if not run.sent then
         browseSend(run)
@@ -566,7 +570,10 @@ ns.on("AUCTION_HOUSE_CLOSED", function()
     late = nil -- whatever list arrives after this is not read
     local run = current
     if not run then return end
-    if run.kind == "browse" then
+    if run.kind == "ladder" then
+        current = nil
+        ns.print("basket abandoned: the auction house was closed")
+    elseif run.kind == "browse" then
         finishBrowse(run, false, "the auction house was closed")
     elseif run.kind == "replicate" then
         run.interrupted = true
@@ -575,6 +582,111 @@ ns.on("AUCTION_HOUSE_CLOSED", function()
             ns.print("full scan: the auction house was closed before the list arrived. Nothing was saved.")
         end
     end
+end)
+
+---------------------------------------------------------------------------------------------------
+-- Price ladders for a basket (board card F13): one search per item, for a handful of mats
+---------------------------------------------------------------------------------------------------
+
+-- Asked for by the player (/tally basket, or a right-click in the Profit panel) and never otherwise. One
+-- query at a time, each only when the throttle is ready, exactly like the pages of a browse scan; nothing is
+-- repeated or kept running. Only unit prices and quantities are read from a result - never who is selling.
+local LADDER_API = { "MakeItemKey", "SendSearchQuery", "IsThrottledMessageSystemReady",
+    "GetNumCommoditySearchResults", "GetCommoditySearchResultInfo" }
+local LADDER_TIMEOUT = 10   -- no answer for one item by then: it counts as not listed, and the next is asked
+local LADDER_MAX_TIERS = 300
+local LADDER_MAX_ITEMS = 12
+
+function ladderNext(run)
+    if current ~= run or run.waiting then return end
+    if run.index >= #run.items then
+        current = nil
+        run.done(run.ladders)
+        return
+    end
+    if not C_AuctionHouse.IsThrottledMessageSystemReady() then return end -- the ready event brings us back
+    run.index = run.index + 1
+    local itemID, index = run.items[run.index], run.index
+    local sorts = {}
+    local order = type(Enum) == "table" and type(Enum.AuctionHouseSortOrder) == "table" and Enum.AuctionHouseSortOrder
+    if order and order.Price ~= nil then sorts[1] = { sortOrder = order.Price, reverseSort = false } end
+    local okKey, key = pcall(C_AuctionHouse.MakeItemKey, itemID)
+    local ok = okKey and pcall(C_AuctionHouse.SendSearchQuery, key, sorts, false)
+    if not ok then return ladderNext(run) end -- this one stays unknown; the basket says so
+    run.waiting = itemID
+    ns.after(LADDER_TIMEOUT, function()
+        if current ~= run or run.index ~= index or run.waiting ~= itemID then return end
+        run.waiting = nil
+        ladderNext(run)
+    end)
+end
+
+-- read(i) -> unit price, quantity of result i
+local function ladderAnswer(itemID, n, read)
+    local run = current
+    if not run or run.kind ~= "ladder" or run.waiting ~= itemID then return end -- somebody else's search
+    local tiers = {}
+    if not ns.isSecret(n) and type(n) == "number" then
+        for i = 1, math.min(n, LADDER_MAX_TIERS) do
+            local price, quantity = read(i)
+            if not ns.isSecret(price) and not ns.isSecret(quantity) and type(price) == "number" and type(quantity) == "number" then
+                tiers[#tiers + 1] = { price, quantity }
+            end
+        end
+    end
+    run.ladders[itemID] = tiers
+    run.waiting = nil
+    ladderNext(run)
+end
+
+-- itemIDs -> done({ [itemID] = { {unitPrice, quantity}, ... } }); an item that never answered has no entry.
+-- -> false after saying why, when nothing was started.
+function Scan.ladders(itemIDs, done)
+    if current then
+        ns.print("a " .. current.kind .. " scan is already running")
+        return false
+    end
+    if not ns.ahOpen then
+        ns.print("open the auction house first")
+        return false
+    end
+    if type(C_AuctionHouse) ~= "table" or type(C_Timer) ~= "table" then
+        ns.print("this client has no C_AuctionHouse")
+        return false
+    end
+    for i = 1, #LADDER_API do
+        if type(C_AuctionHouse[LADDER_API[i]]) ~= "function" then
+            ns.print("this client has no C_AuctionHouse." .. LADDER_API[i])
+            return false
+        end
+    end
+    if type(itemIDs) ~= "table" or #itemIDs > LADDER_MAX_ITEMS then
+        ns.print("that recipe has too many auction house mats to price in one go")
+        return false
+    end
+    local run = { kind = "ladder", items = itemIDs, index = 0, ladders = {}, done = done }
+    current = run
+    ladderNext(run)
+    return true
+end
+
+ns.on("COMMODITY_SEARCH_RESULTS_UPDATED", function(itemID)
+    ladderAnswer(itemID, C_AuctionHouse.GetNumCommoditySearchResults(itemID), function(i)
+        local r = C_AuctionHouse.GetCommoditySearchResultInfo(itemID, i)
+        if type(r) ~= "table" then return nil end
+        return r.unitPrice, r.quantity
+    end)
+end)
+
+-- A mat that is sold as single listings rather than pooled.
+ns.on("ITEM_SEARCH_RESULTS_UPDATED", function(itemKey)
+    if type(itemKey) ~= "table" or type(C_AuctionHouse.GetNumItemSearchResults) ~= "function"
+        or type(C_AuctionHouse.GetItemSearchResultInfo) ~= "function" then return end
+    ladderAnswer(itemKey.itemID, C_AuctionHouse.GetNumItemSearchResults(itemKey), function(i)
+        local r = C_AuctionHouse.GetItemSearchResultInfo(itemKey, i)
+        if type(r) ~= "table" then return nil end
+        return r.buyoutAmount, r.quantity
+    end)
 end)
 
 ---------------------------------------------------------------------------------------------------

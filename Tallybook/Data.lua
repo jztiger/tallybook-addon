@@ -8,6 +8,7 @@ local _, ns = ...
 
 ns.baked = {
     builtAt = 0,
+    settings = {},
     vendor = {
     },
     recipes = {

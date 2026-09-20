@@ -1,4 +1,5 @@
--- Tallybook: the Crafting Cost next to each recipe in the profession window's recipe list.
+-- Tallybook: a number next to each recipe in the profession window's recipe list - the profit of crafting it to
+-- sell (green / red), or with "/tally list cost" its crafting cost coloured the same way.
 --
 -- Display only. It prices recipes with what Craft.lua learned (or Data.lua brought back) and the last
 -- browse scan; it asks the game and the server nothing. The game recycles list rows as the player
@@ -16,7 +17,8 @@ local PAD = 6        -- between the cost and the row's right edge, and between t
 local LABEL_LEFT = 36 -- where a recipe name starts when the row cannot say
 
 local hooked = false
-local index -- recipeID -> recipe entry; dropped whenever something new is learned
+local GREEN, RED, CLOSE = "|cff00ff00", "|cffff2020", "|r"
+local index, outputs -- recipeID -> recipe entry / output item; dropped whenever something new is learned
 
 local function scrollBox()
     local frame = ProfessionsFrame
@@ -27,17 +29,29 @@ local function scrollBox()
     return nil
 end
 
--- "<money>", "<money> +?" when some mats have no price, "?" when none has; nil for a recipe never seen
+-- What a row says; nil for a recipe never seen.
+--   list = "profit" (default): "+<money>" green or "-<money>" red - crafting to sell at the Min AH Price
+--   list = "cost":             the crafting cost, green when the craft pays and red when it does not
+-- When the profit cannot be told (a mat with no price, nobody selling) both fall back to the plain cost:
+-- "<money>", "<money> +?" when some mats have no price, "?" when none has.
 function List.costText(recipeID)
     if ns.isSecret(recipeID) or type(recipeID) ~= "number" then return nil end
     local db = TallybookDB
     if type(db) ~= "table" then return nil end
-    if not index then index = Logic.recipeIndex(db.recipes) end
-    local total, missing = Logic.craftingCost(index[recipeID], db.prices, db.vendor)
+    if not index then index, outputs = Logic.recipeIndex(db.recipes) end
+    local entry = index[recipeID]
+    local total, missing = Logic.craftingCost(entry, db.prices, db.vendor)
     if not total then return nil end
-    if missing == 0 then return ns.UI.money(total) end
-    if total == 0 then return "?" end
-    return ns.UI.money(total) .. " +?"
+    if missing > 0 then
+        if total == 0 then return "?" end
+        return ns.UI.money(total) .. " +?"
+    end
+    local itemID = outputs[recipeID]
+    local profit = Logic.craftingProfit(total, missing, entry.qty, itemID and type(db.prices) == "table" and db.prices[itemID] or nil)
+    if not profit then return ns.UI.money(total) end
+    local colour = profit >= 0 and GREEN or RED
+    if ns.settings().list == "cost" then return colour .. ns.UI.money(total) .. CLOSE end
+    return colour .. (profit >= 0 and "+" or "-") .. ns.UI.money(math.abs(profit)) .. CLOSE
 end
 
 -- A list entry is a tree node: node:GetData().recipeInfo.recipeID. Category headers have no recipeInfo.

@@ -9,7 +9,7 @@ ns = ns or {}
 local L = {}
 ns.Logic = L
 
-L.VERSION = "0.5.0"
+L.VERSION = "0.7.0"
 L.SCHEMA = 1
 L.REPLICATE_COOLDOWN = 900
 -- What the auction house keeps of a sale, in percent (5 at a faction auction house in every version of
@@ -235,6 +235,19 @@ function L.priceTable(browseRows)
     return prices
 end
 
+-- -> { [itemID] = how many are listed, all variants together }. For the Profit panel's "Listed" column.
+function L.listedTable(browseRows)
+    local listed = {}
+    if type(browseRows) ~= "table" then return listed end
+    for i = 1, #browseRows do
+        local row = browseRows[i]
+        if type(row) == "table" and isCount(row[1], 1) and isCount(row[5], 0) then
+            listed[row[1]] = (listed[row[1]] or 0) + row[5]
+        end
+    end
+    return listed
+end
+
 ---------------------------------------------------------------------------------------------------
 -- The scan document (design spec section 5; src/shared/scan-schema.ts is the contract)
 ---------------------------------------------------------------------------------------------------
@@ -402,6 +415,8 @@ function L.initDB(db)
     if type(db.chunks) ~= "table" then db.chunks = {} end
     if type(db.recipes) ~= "table" then db.recipes = {} end
     if type(db.vendor) ~= "table" then db.vendor = {} end
+    if type(db.listed) ~= "table" then db.listed = {} end
+    if type(db.settings) ~= "table" then db.settings = {} end
     return db
 end
 
@@ -519,6 +534,84 @@ function L.vendorUnitPrice(item)
     return math.ceil(item.price / stack)
 end
 
+---------------------------------------------------------------------------------------------------
+-- The basket (board card F13): what N crafts really cost. "Cheapest listing x quantity" is optimistic for a
+-- batch - the cheap listings run out. Given each auction-house mat's price ladder (Scan.ladders), buy from
+-- the cheapest tier up. Vendor mats stay at the vendor price: unlimited supply.
+---------------------------------------------------------------------------------------------------
+
+L.BASKET_MAX_CRAFTS = 1000
+
+-- tiers: { {unitPrice, quantity}, ... } in any order. -> cost of the cheapest `need` units, how many were there
+function L.walkLadder(tiers, need)
+    local sorted = {}
+    if type(tiers) == "table" then
+        for i = 1, #tiers do
+            local t = tiers[i]
+            if type(t) == "table" and isCount(t[1], 1) and isCount(t[2], 1) then sorted[#sorted + 1] = t end
+        end
+    end
+    table.sort(sorted, function(a, b) return a[1] < b[1] end)
+    local cost, bought = 0, 0
+    if not isCount(need, 1) then return cost, bought end
+    for i = 1, #sorted do
+        if bought >= need then break end
+        local take = math.min(sorted[i][2], need - bought)
+        cost = cost + take * sorted[i][1]
+        bought = bought + take
+    end
+    return cost, bought
+end
+
+-- The mats whose ladder has to be asked for: no vendor sells them. Each once, in recipe order.
+function L.ladderMats(recipe, vendor)
+    local out, seen = {}, {}
+    if type(recipe) ~= "table" or not validMats(recipe.mats) then return out end
+    for i = 1, #recipe.mats do
+        local itemID = recipe.mats[i][1]
+        local shop = type(vendor) == "table" and vendor[itemID] or nil
+        if not isCount(shop, 1) and not seen[itemID] then
+            seen[itemID] = true
+            out[#out + 1] = itemID
+        end
+    end
+    return out
+end
+
+-- ladders: { [itemID] = tiers }. -> { crafts, total, perCraft, short, missing, rows = { { itemID, need, bought,
+-- cost, cheapest, source = "vendor" | "ah" }, ... } }   or nil for a recipe or a number of crafts that makes no sense.
+-- short: mats with fewer listed than needed (priced as far as they go). missing: mats with nothing to price them
+-- by. Neither is ever counted as free - the total is then a floor, and the caller says so.
+function L.basket(recipe, crafts, vendor, ladders)
+    if type(recipe) ~= "table" or not validMats(recipe.mats) then return nil end
+    if not isCount(crafts, 1) or crafts > L.BASKET_MAX_CRAFTS then return nil end
+    local out = { crafts = crafts, total = 0, short = 0, missing = 0, rows = {} }
+    for i = 1, #recipe.mats do
+        local itemID, need = recipe.mats[i][1], recipe.mats[i][2] * crafts
+        local row = { itemID = itemID, need = need, bought = 0, cost = 0 }
+        local shop = type(vendor) == "table" and vendor[itemID] or nil
+        local tiers = type(ladders) == "table" and ladders[itemID] or nil
+        if isCount(shop, 1) then
+            row.bought, row.cost, row.cheapest, row.source = need, shop * need, shop, "vendor"
+        elseif type(tiers) == "table" then
+            row.cost, row.bought = L.walkLadder(tiers, need)
+            if row.bought > 0 then
+                row.source = "ah"
+                row.cheapest = (L.walkLadder(tiers, 1))
+            end
+        end
+        if row.bought == 0 then
+            out.missing = out.missing + 1
+        elseif row.bought < need then
+            out.short = out.short + 1
+        end
+        out.total = out.total + row.cost
+        out.rows[i] = row
+    end
+    out.perCraft = math.ceil(out.total / crafts)
+    return out
+end
+
 -- recipes[outputItemID] lists -> { [recipeID] = entry }, { [recipeID] = outputItemID }.
 -- The profession window lists recipes, not items.
 function L.recipeIndex(book)
@@ -547,7 +640,7 @@ end
 --          why = "mats" | "nosale" }, counts { profit, loss, unknown }
 -- sale is what the recipe makes at the cheapest listing, before the cut; profit is after it. Breaking even is
 -- a profit. A recipe never read, or one that makes no item, is left out: there is nothing honest to say.
-function L.profitSummary(recipeIDs, index, outputs, prices, vendor)
+function L.profitSummary(recipeIDs, index, outputs, prices, vendor, listed)
     local rows, counts = {}, { profit = 0, loss = 0, unknown = 0 }
     if type(recipeIDs) ~= "table" or type(index) ~= "table" or type(outputs) ~= "table" then return rows, counts end
     for i = 1, #recipeIDs do
@@ -557,6 +650,7 @@ function L.profitSummary(recipeIDs, index, outputs, prices, vendor)
         if cost and isCount(itemID, 1) then
             local qty = isCount(entry.qty, 1) and entry.qty or 1
             local row = { recipeID = recipeID, itemID = itemID, qty = qty, cost = cost, missing = missing }
+            if type(listed) == "table" and isCount(listed[itemID], 0) then row.listed = listed[itemID] end
             local price = type(prices) == "table" and prices[itemID] or nil
             local profit = L.craftingProfit(cost, missing, qty, price)
             if profit then
@@ -573,7 +667,7 @@ function L.profitSummary(recipeIDs, index, outputs, prices, vendor)
     return rows, counts
 end
 
-local SORT_KEYS = { profit = "number", cost = "number", sale = "number", name = "string" }
+local SORT_KEYS = { profit = "number", cost = "number", sale = "number", listed = "number", name = "string" }
 
 -- Sorts in place and returns rows. A row with nothing under this key goes last in either direction; ties
 -- keep recipe order, so the list never shuffles between refreshes. An unknown key leaves the order alone.
@@ -605,6 +699,46 @@ end
 -- back as addon code: Data.lua, written by the bake step (src/shared/bake.ts) and loaded like any
 -- other file of the addon. Learned this session always beats baked; baked only fills the gaps.
 ---------------------------------------------------------------------------------------------------
+
+-- What the player has chosen, remembered two ways: TallybookDB.settings (read back the day the client reads
+-- saved data again) and, until then, the baked copy that went out in the reference document and came back in
+-- Data.lua at the last install. Saved beats baked beats the default, field by field; anything that is not a
+-- known value is ignored. panel = { point, relativePoint, x, y } of the Profit panel after a drag.
+local LIST_MODES = { profit = true, cost = true }
+local POINTS = { TOPLEFT = true, TOP = true, TOPRIGHT = true, LEFT = true, CENTER = true, RIGHT = true,
+    BOTTOMLEFT = true, BOTTOM = true, BOTTOMRIGHT = true }
+
+local function finite(v)
+    return type(v) == "number" and v == v and v > -1e6 and v < 1e6
+end
+
+local function validPanel(p)
+    return type(p) == "table" and POINTS[p[1]] and POINTS[p[2]] and finite(p[3]) and finite(p[4])
+end
+
+-- Only the fields that hold a usable value, copied.
+local function cleanSettings(src)
+    local out = {}
+    if type(src) ~= "table" then return out end
+    if LIST_MODES[src.list] then out.list = src.list end
+    if SORT_KEYS[src.sortKey] then out.sortKey = src.sortKey end
+    for _, flag in ipairs({ "sortDesc", "knownOnly", "hideUnknown" }) do
+        if type(src[flag]) == "boolean" then out[flag] = src[flag] end
+    end
+    if validPanel(src.panel) then
+        local function cents(v) return math.floor(v * 100 + 0.5) / 100 end
+        out.panel = { src.panel[1], src.panel[2], cents(src.panel[3]), cents(src.panel[4]) }
+    end
+    return out
+end
+
+function L.settings(saved, baked)
+    local out = { list = "profit", sortKey = "profit", sortDesc = true, knownOnly = true, hideUnknown = false }
+    for _, layer in ipairs({ cleanSettings(baked), cleanSettings(saved) }) do
+        for key, value in pairs(layer) do out[key] = value end
+    end
+    return out
+end
 
 local function sortedKeys(tbl)
     local keys = {}
@@ -641,8 +775,16 @@ function L.refDoc(db, at)
             end
         end
     end
-    if #vendor == 0 and #recipes == 0 then return nil end
-    return { schema = L.SCHEMA, kind = "ref", at = countOr0(at), addon = L.VERSION, vendor = vendor, recipes = recipes }
+    local settings = cleanSettings(db.settings)
+    local hasSettings = false
+    for _ in pairs(settings) do
+        hasSettings = true
+        break
+    end
+    if #vendor == 0 and #recipes == 0 and not hasSettings then return nil end
+    local doc = { schema = L.SCHEMA, kind = "ref", at = countOr0(at), addon = L.VERSION, vendor = vendor, recipes = recipes }
+    if hasSettings then doc.settings = settings end
+    return doc
 end
 
 -- -> "r1:<b64>"   (its own tag: the scan extractor on the server only ever looks for "j1:" and "end:")

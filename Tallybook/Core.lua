@@ -131,6 +131,15 @@ function ns.beforeWrite()
     if ns.Export and ns.Export.saveRef then pcall(ns.Export.saveRef) end
 end
 
+-- What the player has chosen (Logic.settings): saved beats what was baked at the last install beats the default.
+function ns.settings()
+    return Logic.settings(ns.db().settings, type(ns.baked) == "table" and ns.baked.settings or nil)
+end
+
+function ns.setSetting(key, value)
+    ns.db().settings[key] = value
+end
+
 -- The ring always ends with the "end:<n>" sentinel - after load, after every save and at logout -
 -- so the file is complete whenever the client writes it, whichever of those moments it honours.
 function ns.sealRing()
@@ -203,6 +212,33 @@ function commands.profit()
     ns.Summary.toggle()
 end
 
+-- /tally basket 20            the recipe last clicked in the Profit panel
+-- /tally basket 20 [item]     or the one that makes a shift-clicked item
+function commands.basket(arg, msg)
+    local crafts = tonumber(arg)
+    if not crafts or crafts < 1 or crafts > Logic.BASKET_MAX_CRAFTS or crafts % 1 ~= 0 then
+        ns.print("/tally basket <how many crafts, 1-" .. string.format("%.0f", Logic.BASKET_MAX_CRAFTS) .. "> [shift-click an item]")
+        return
+    end
+    local chosen = ns.Summary.chosen
+    local linked = type(msg) == "string" and tonumber(string.match(msg, "item:(%d+)")) or nil
+    if linked then
+        local db = ns.db()
+        local recipeID = Logic.cheapestRecipe(db.recipes[linked], db.prices, db.vendor)
+        chosen = recipeID and { recipeID = recipeID, itemID = linked } or nil
+    end
+    ns.Craft.basket(crafts, chosen)
+end
+
+-- /tally list profit | cost : what the number next to each recipe in the profession window is
+function commands.list(arg)
+    if arg == "profit" or arg == "cost" then
+        ns.setSetting("list", arg)
+        ns.changed()
+    end
+    ns.print("recipe list shows: " .. ns.settings().list .. "   (/tally list profit | /tally list cost)")
+end
+
 -- The only place in the addon that reloads the UI, and only because the player typed it.
 function commands.reload()
     if ns.Scan.busy() then
@@ -220,15 +256,18 @@ end
 SLASH_TALLYBOOK1 = "/tally"
 SLASH_TALLYBOOK2 = "/tallybook"
 SlashCmdList["TALLYBOOK"] = function(msg)
-    local word = ""
-    if type(msg) == "string" then word = string.lower(string.match(msg, "^%s*(%S*)") or "") end
+    local word, arg = "", ""
+    if type(msg) == "string" then
+        word, arg = string.match(string.lower(msg), "^%s*(%S*)%s*(%S*)")
+        word, arg = word or "", arg or ""
+    end
     if word == "" then word = "status" end
     reported = {}
     local command = commands[word]
     if not command then
-        ns.print("commands: /tally (status) | /tally scan | /tally browse | /tally profit | /tally selftest | /tally reload")
+        ns.print("commands: /tally (status) | /tally scan | /tally browse | /tally profit | /tally basket | /tally list | /tally selftest | /tally reload")
         return
     end
-    local ok, err = pcall(command)
+    local ok, err = pcall(command, arg, msg)
     if not ok then ns.fail("/tally " .. word, err) end
 end

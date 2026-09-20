@@ -124,6 +124,66 @@ function Craft.learnVendor()
     end
 end
 
+---------------------------------------------------------------------------------------------------
+-- The basket (board card F13): what N crafts of one recipe really cost
+---------------------------------------------------------------------------------------------------
+
+-- chosen = { recipeID =, itemID =, name = }. Asks Scan for the ladder of every mat no vendor sells, then prints
+-- the batch: each mat, the total, the cost of one craft next to the optimistic cheapest-listing figure, and the
+-- profit of one craft when everything could be priced. Started by the player, one report, nothing kept running.
+function Craft.basket(crafts, chosen)
+    local db = Logic.initDB(TallybookDB)
+    local index = Logic.recipeIndex(db.recipes)
+    local recipe = type(chosen) == "table" and index[chosen.recipeID] or nil
+    if not recipe then
+        ns.print("click a recipe in the Profit panel first, or shift-click its item: /tally basket 20 [item]")
+        return
+    end
+    local money, itemName = ns.UI.money, ns.UI.itemName
+    local function report(ladders)
+        local b = Logic.basket(recipe, crafts, db.vendor, ladders)
+        if not b then return end
+        ns.print(string.format("basket: %.0f x %s", crafts, tostring(chosen.name or itemName(chosen.itemID))))
+        for i = 1, #b.rows do
+            local row = b.rows[i]
+            local line = string.format("  %.0f x %s", row.need, itemName(row.itemID))
+            if row.source == "vendor" then
+                line = line .. " (vendor): " .. money(row.cost)
+            elseif row.bought == 0 then
+                line = line .. ": nobody is selling any"
+            elseif row.bought < row.need then
+                line = line .. string.format(": only %.0f listed - ", row.bought) .. money(row.cost) .. " for those"
+            else
+                line = line .. ": " .. money(row.cost)
+                if row.need > 1 then
+                    line = line .. "  (average " .. money(math.ceil(row.cost / row.need)) .. ", cheapest " .. money(row.cheapest) .. ")"
+                end
+            end
+            ns.print(line)
+        end
+        if b.short > 0 or b.missing > 0 then
+            ns.print("total at least " .. money(b.total) .. string.format(" - %.0f %s could not be fully priced",
+                b.short + b.missing, (b.short + b.missing) == 1 and "mat" or "mats"))
+            return
+        end
+        local line = "total " .. money(b.total) .. " - " .. money(b.perCraft) .. " each"
+        local estimate, missing = Logic.craftingCost(recipe, db.prices, db.vendor)
+        if estimate and missing == 0 then line = line .. "  (cheapest-listing estimate: " .. money(estimate) .. " each)" end
+        ns.print(line)
+        local price = type(db.prices) == "table" and db.prices[chosen.itemID] or nil
+        local profit = Logic.craftingProfit(b.perCraft, 0, recipe.qty, price)
+        if profit then
+            ns.print("sells for " .. money(price) .. ": " .. money(math.abs(profit)) .. (profit >= 0 and " profit" or " LOSS") .. " each")
+        end
+    end
+
+    local mats = Logic.ladderMats(recipe, db.vendor)
+    if #mats == 0 then return report({}) end -- every mat comes from a vendor: nothing to ask the auction house
+    if ns.Scan.ladders(mats, report) then
+        ns.print(string.format("pricing %.0f crafts: asking the auction house about %.0f %s ...", crafts, #mats, #mats == 1 and "mat" or "mats"))
+    end
+end
+
 ns.on("TRADE_SKILL_SHOW", Craft.learnRecipes)
 ns.on("TRADE_SKILL_LIST_UPDATE", Craft.learnRecipes)
 ns.on("MERCHANT_SHOW", Craft.learnVendor)
