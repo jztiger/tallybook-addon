@@ -1,0 +1,395 @@
+-- Tallybook: the profit summary of the open profession - a "Profit" button on the profession window and a
+-- panel beside it with one row per recipe: cost, what it sells for, profit or loss.
+--
+-- Display only. The numbers are the tooltip's (Logic.profitSummary); opening, sorting and scrolling the
+-- panel asks the game for recipe names and nothing else, and asks the server nothing. Both the button and
+-- the panel sit OUTSIDE the profession window's right edge, so they cover nothing of the game's whatever
+-- its layout. No templates are required: if the panel cannot be built on this client, /tally profit
+-- prints the summary in chat instead. Nothing here crafts, buys or queues anything.
+
+local _, ns = ...
+local Logic = ns.Logic
+
+local Summary = {}
+ns.Summary = Summary
+
+local VISIBLE, ROW_H = 20, 18 -- rows on screen, and the height of one
+local TOP = 88                -- where the rows start, below the title, counts, toggles and column headers
+local WHEEL = 3               -- rows per notch of the mouse wheel
+-- columns: key, header text, left edge, width, alignment
+local COLUMNS = {
+    { "name", "Recipe", 12, 190, "LEFT" },
+    { "cost", "Cost", 206, 84, "RIGHT" },
+    { "sale", "Sells for", 294, 84, "RIGHT" },
+    { "profit", "Profit / Loss", 382, 124, "RIGHT" },
+}
+local WIDTH = 518
+-- The profession tabs hang off the window's right edge (about 45 wide on this client): the panel starts past them.
+local CLEAR_OF_TABS = 52
+local GREEN, RED, GREY, CLOSE = "|cff00ff00", "|cffff2020", "|cff808080", "|r"
+
+local state = { key = "profit", descending = true, knownOnly = true, hideUnknown = false, offset = 0 }
+local panel, cannotBuild
+local current, counts = {}, { profit = 0, loss = 0, unknown = 0 }
+
+local function window()
+    if type(ProfessionsFrame) == "table" then return ProfessionsFrame end
+    return nil
+end
+
+local function windowOpen()
+    local w = window()
+    if not w then return false end
+    if type(w.IsShown) == "function" then return w:IsShown() and true or false end
+    return true
+end
+
+-- Runs a widget script under pcall: a failure in here must never reach the game's own window.
+local function guarded(fn)
+    return function(...)
+        local ok, err = pcall(fn, ...)
+        if not ok then ns.fail("summary", err) end
+    end
+end
+
+local function professionName()
+    local T = C_TradeSkillUI
+    if type(T) == "table" and type(T.GetBaseProfessionInfo) == "function" then
+        local ok, info = pcall(T.GetBaseProfessionInfo)
+        if ok and not ns.isSecret(info) and type(info) == "table" and type(info.professionName) == "string"
+            and info.professionName ~= "" then
+            return info.professionName
+        end
+    end
+    return "Profession"
+end
+
+local function plural(n, one, many)
+    return string.format("%.0f", n) .. " " .. (n == 1 and one or many)
+end
+
+local function countsText()
+    return string.format("%.0f profitable, %.0f at a loss, %.0f unknown", counts.profit, counts.loss, counts.unknown)
+end
+
+---------------------------------------------------------------------------------------------------
+-- The rows
+---------------------------------------------------------------------------------------------------
+
+-- The open profession's recipes -> current (filtered, named, sorted) and counts (before "hide unknown").
+local function compute()
+    current, counts = {}, { profit = 0, loss = 0, unknown = 0 }
+    local T, db = C_TradeSkillUI, TallybookDB
+    if type(T) ~= "table" or type(T.GetAllRecipeIDs) ~= "function" or type(db) ~= "table" then return end
+    local ok, ids = pcall(T.GetAllRecipeIDs)
+    if not ok or type(ids) ~= "table" then return end
+
+    local wanted, names = {}, {}
+    for i = 1, #ids do
+        local recipeID = ids[i]
+        local learned = true
+        if type(T.GetRecipeInfo) == "function" then
+            local okInfo, info = pcall(T.GetRecipeInfo, recipeID)
+            if okInfo and not ns.isSecret(info) and type(info) == "table" then
+                if info.learned == false then learned = false end
+                if not ns.isSecret(info.name) and type(info.name) == "string" and info.name ~= "" then
+                    names[recipeID] = info.name
+                end
+            end
+        end
+        if learned or not state.knownOnly then wanted[#wanted + 1] = recipeID end
+    end
+
+    local index, outputs = Logic.recipeIndex(db.recipes)
+    local rows
+    rows, counts = Logic.profitSummary(wanted, index, outputs, db.prices, db.vendor)
+    for i = 1, #rows do
+        local row = rows[i]
+        row.name = names[row.recipeID] or ns.UI.itemName(row.itemID)
+        if not (state.hideUnknown and row.status == "unknown") then current[#current + 1] = row end
+    end
+    Logic.sortSummary(current, state.key, state.descending)
+end
+
+local function costText(row)
+    if row.missing == 0 then return ns.UI.money(row.cost) end
+    if row.cost == 0 then return "?" end
+    return ns.UI.money(row.cost) .. " +?"
+end
+
+local function resultText(row)
+    if row.status == "profit" then return GREEN .. "+" .. ns.UI.money(row.profit) .. CLOSE end
+    if row.status == "loss" then return RED .. "-" .. ns.UI.money(-row.profit) .. CLOSE end
+    if row.why == "mats" then return GREY .. plural(row.missing, "mat", "mats") .. " with no price" .. CLOSE end
+    return GREY .. "nobody selling" .. CLOSE
+end
+
+---------------------------------------------------------------------------------------------------
+-- The panel
+---------------------------------------------------------------------------------------------------
+
+-- What a button says: through its own label when it has one, else the template's text.
+function Summary.textOf(widget)
+    if type(widget) ~= "table" then return nil end
+    if widget.label then return widget.label:GetText() end
+    return widget:GetText()
+end
+
+local function setText(widget, text)
+    if widget.label then widget.label:SetText(text) else widget:SetText(text) end
+end
+
+local function newLabel(parent, font, justify)
+    local text = parent:CreateFontString(nil, "OVERLAY", font)
+    text:SetJustifyH(justify or "LEFT")
+    text:SetWordWrap(false)
+    return text
+end
+
+-- A plain button with its own text: needs no template, so it cannot be missing on this client.
+local function textButton(parent, width, justify, onClick)
+    local button = CreateFrame("Button", nil, parent)
+    button:SetSize(width, ROW_H)
+    button.label = newLabel(button, "GameFontNormalSmall", justify)
+    button.label:SetAllPoints()
+    button:SetScript("OnClick", guarded(onClick))
+    return button
+end
+
+local function paint()
+    if not panel then return end
+    local db = TallybookDB
+    local hasPrices = false
+    if type(db) == "table" and type(db.prices) == "table" then
+        for _ in pairs(db.prices) do
+            hasPrices = true
+            break
+        end
+    end
+    if hasPrices then
+        panel.title:SetText(professionName() .. " - prices from " .. Logic.formatAge(ns.serverTime() - db.pricesAt) .. " ago")
+    else
+        panel.title:SetText(professionName() .. " - no AH prices yet: /tally browse at the auction house")
+    end
+
+    local last = math.max(0, #current - VISIBLE)
+    if state.offset > last then state.offset = last end
+    if state.offset < 0 then state.offset = 0 end
+    local range = ""
+    if #current > VISIBLE then
+        range = string.format("   (%.0f-%.0f of %.0f)", state.offset + 1, state.offset + VISIBLE, #current)
+    end
+    panel.counts:SetText(countsText() .. range)
+
+    setText(panel.knownToggle, (state.knownOnly and "[x]" or "[ ]") .. " recipes I know only")
+    setText(panel.unknownToggle, (state.hideUnknown and "[x]" or "[ ]") .. " hide unknown")
+    for i = 1, #COLUMNS do
+        local key, title = COLUMNS[i][1], COLUMNS[i][2]
+        if key == state.key then title = title .. (state.descending and " v" or " ^") end
+        setText(panel.headers[key], title)
+    end
+
+    for i = 1, VISIBLE do
+        local row, data = panel.rows[i], current[state.offset + i]
+        row.data = data
+        if data then
+            row.name:SetText(data.name)
+            row.cost:SetText(costText(data))
+            row.sale:SetText(data.sale and ns.UI.money(data.sale) or "-")
+            row.result:SetText(resultText(data))
+            row:Show()
+        else
+            row:Hide()
+        end
+    end
+end
+
+local function build(parent)
+    local p = CreateFrame("Frame", nil, parent)
+    p:SetSize(WIDTH, TOP + VISIBLE * ROW_H + 10)
+    p:SetPoint("TOPLEFT", parent, "TOPRIGHT", CLEAR_OF_TABS, -56)
+    -- Readable whatever is behind it: a solid background, and above the quest tracker, meters and action bars
+    -- (tooltips and menus are higher still).
+    p:SetFrameStrata("HIGH")
+    p:SetToplevel(true)
+    p:EnableMouse(true) -- clicks on the panel do not fall through to the world behind it
+    p.background = p:CreateTexture(nil, "BACKGROUND")
+    p.background:SetAllPoints()
+    p.background:SetColorTexture(0.06, 0.06, 0.07, 1)
+    -- a one-pixel frame and a band behind the title, so the panel reads as a window and not as a shadow
+    for _, edge in ipairs({ { "TOPLEFT", "TOPRIGHT", nil, 1 }, { "BOTTOMLEFT", "BOTTOMRIGHT", nil, 1 },
+        { "TOPLEFT", "BOTTOMLEFT", 1, nil }, { "TOPRIGHT", "BOTTOMRIGHT", 1, nil } }) do
+        local line = p:CreateTexture(nil, "BORDER")
+        line:SetColorTexture(0.55, 0.45, 0.2, 1)
+        line:SetPoint(edge[1], p, edge[1], 0, 0)
+        line:SetPoint(edge[2], p, edge[2], 0, 0)
+        if edge[3] then line:SetWidth(edge[3]) end
+        if edge[4] then line:SetHeight(edge[4]) end
+    end
+    local band = p:CreateTexture(nil, "BORDER")
+    band:SetColorTexture(1, 1, 1, 0.06)
+    band:SetPoint("TOPLEFT", p, "TOPLEFT", 1, -1)
+    band:SetPoint("TOPRIGHT", p, "TOPRIGHT", -1, -1)
+    band:SetHeight(TOP - 4)
+
+    -- Drag it anywhere with the left button. (Where it was is not remembered: saved data is not read back.)
+    p:SetMovable(true)
+    p:SetClampedToScreen(true)
+    p:RegisterForDrag("LeftButton")
+    p:SetScript("OnDragStart", guarded(function(self) self:StartMoving() end))
+    p:SetScript("OnDragStop", guarded(function(self) self:StopMovingOrSizing() end))
+
+    p.title = newLabel(p, "GameFontNormal")
+    p.title:SetPoint("TOPLEFT", p, "TOPLEFT", 12, -10)
+    p.counts = newLabel(p, "GameFontHighlightSmall")
+    p.counts:SetPoint("TOPLEFT", p, "TOPLEFT", 12, -28)
+
+    local close = textButton(p, 20, "CENTER", function() Summary.toggle() end)
+    close:SetPoint("TOPRIGHT", p, "TOPRIGHT", -6, -6)
+    setText(close, "x")
+
+    p.knownToggle = textButton(p, 170, "LEFT", function()
+        state.knownOnly = not state.knownOnly
+        state.offset = 0
+        Summary.refresh()
+    end)
+    p.knownToggle:SetPoint("TOPLEFT", p, "TOPLEFT", 12, -46)
+    p.unknownToggle = textButton(p, 130, "LEFT", function()
+        state.hideUnknown = not state.hideUnknown
+        state.offset = 0
+        Summary.refresh()
+    end)
+    p.unknownToggle:SetPoint("TOPLEFT", p, "TOPLEFT", 190, -46)
+
+    p.headers = {}
+    for i = 1, #COLUMNS do
+        local key, _, left, width, justify = COLUMNS[i][1], COLUMNS[i][2], COLUMNS[i][3], COLUMNS[i][4], COLUMNS[i][5]
+        local header = textButton(p, width, justify, function()
+            if state.key == key then
+                state.descending = not state.descending
+            else
+                state.key, state.descending = key, key ~= "name" -- numbers start biggest first, names A to Z
+            end
+            state.offset = 0
+            Summary.refresh()
+        end)
+        header:SetPoint("TOPLEFT", p, "TOPLEFT", left, -68)
+        p.headers[key] = header
+    end
+
+    p.rows = {}
+    for i = 1, VISIBLE do
+        local row = CreateFrame("Button", nil, p)
+        row:SetSize(WIDTH - 2, ROW_H)
+        row:SetPoint("TOPLEFT", p, "TOPLEFT", 1, -(TOP + (i - 1) * ROW_H))
+        if i % 2 == 0 then -- every other row shaded: the eye can follow a name across to its numbers
+            row.stripe = row:CreateTexture(nil, "BACKGROUND")
+            row.stripe:SetAllPoints()
+            row.stripe:SetColorTexture(1, 1, 1, 0.05)
+        end
+        row.glow = row:CreateTexture(nil, "BORDER")
+        row.glow:SetAllPoints()
+        row.glow:SetColorTexture(1, 0.82, 0, 0.14)
+        row.glow:Hide()
+        local fields = { "name", "cost", "sale", "result" }
+        for c = 1, #COLUMNS do
+            local text = newLabel(row, "GameFontHighlightSmall", COLUMNS[c][5])
+            text:SetWidth(COLUMNS[c][4])
+            text:SetPoint("LEFT", row, "LEFT", COLUMNS[c][3], 0)
+            row[fields[c]] = text
+        end
+        -- The item's own tooltip carries the full breakdown (UI.lua adds it to every item tooltip).
+        row:SetScript("OnEnter", guarded(function(self)
+            self.glow:Show()
+            if not self.data or type(GameTooltip) ~= "table" or type(GameTooltip.SetItemByID) ~= "function"
+                or type(GameTooltip_SetDefaultAnchor) ~= "function" then return end
+            GameTooltip_SetDefaultAnchor(GameTooltip, self)
+            GameTooltip:SetItemByID(self.data.itemID)
+            GameTooltip:Show()
+        end))
+        row:SetScript("OnLeave", guarded(function(self)
+            self.glow:Hide()
+            if type(GameTooltip) == "table" and type(GameTooltip.Hide) == "function" then GameTooltip:Hide() end
+        end))
+        p.rows[i] = row
+    end
+
+    p:EnableMouseWheel(true)
+    p:SetScript("OnMouseWheel", guarded(function(_, delta)
+        state.offset = state.offset - delta * WHEEL
+        paint()
+    end))
+    p:Hide()
+    return p
+end
+
+---------------------------------------------------------------------------------------------------
+-- Opening it
+---------------------------------------------------------------------------------------------------
+
+-- Re-reads and re-draws an open panel. Called when anything is learned or scanned (ns.changed) - which
+-- includes the profession window changing what it shows: Craft.lua re-reads the recipes then, and says so
+-- once at the end, however many list events the game sent in between.
+function Summary.refresh()
+    if not panel or not panel:IsShown() then return end
+    compute()
+    paint()
+end
+
+-- The same summary as a few chat lines, for a client on which the panel cannot be built.
+local function chatSummary()
+    compute()
+    ns.print(professionName() .. ": " .. countsText())
+    local shown = 0
+    Logic.sortSummary(current, "profit", true)
+    for i = 1, #current do
+        if current[i].status ~= "profit" or shown == 5 then break end
+        shown = shown + 1
+        ns.print("  " .. tostring(current[i].name) .. ": " .. resultText(current[i]))
+    end
+end
+
+function Summary.toggle()
+    if not windowOpen() then
+        ns.print("open a profession window first - the summary is of the profession you have open")
+        return
+    end
+    if not panel and not cannotBuild then
+        local ok, built = pcall(build, window())
+        if ok then
+            panel = built
+            Summary.panel = built
+        else
+            cannotBuild = true
+        end
+    end
+    if not panel then
+        chatSummary()
+        return
+    end
+    panel:SetShown(not panel:IsShown())
+    state.offset = 0
+    Summary.refresh()
+end
+
+-- The "Profit" button, once, as soon as the game has built its profession window.
+function Summary.attach()
+    if Summary.button or cannotBuild or not window() then return end
+    local ok, button = pcall(CreateFrame, "Button", nil, window(), "UIPanelButtonTemplate")
+    if not ok then
+        ok, button = pcall(textButton, window(), 60, "CENTER", function() end)
+        if not ok then return end
+    end
+    button:SetSize(60, 22)
+    button:SetPoint("TOPLEFT", window(), "TOPRIGHT", 2, -28)
+    setText(button, "Profit")
+    button:SetScript("OnClick", guarded(function() Summary.toggle() end))
+    Summary.button = button
+end
+
+ns.onChange(Summary.refresh)
+ns.on("TRADE_SKILL_SHOW", Summary.attach)
+ns.on("TRADE_SKILL_LIST_UPDATE", Summary.attach)
+ns.on("ADDON_LOADED", function(name)
+    if name == "Blizzard_Professions" then Summary.attach() end
+end)

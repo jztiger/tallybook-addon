@@ -1,0 +1,718 @@
+-- Tallybook: pure logic. No WoW API in this file, only the Lua 5.1 standard library, so every function
+-- here is unit-tested outside the game (addon/tests/logic.test.ts).
+--
+-- Numbers: the game's Lua 5.1 has one number type (a double). Anything that ends up in a saved string is
+-- written with "%d" and never with tostring() or "..", so it reads "1" and never "1.0" on any Lua.
+
+local ADDON, ns = ...
+ns = ns or {}
+local L = {}
+ns.Logic = L
+
+L.VERSION = "0.5.0"
+L.SCHEMA = 1
+L.REPLICATE_COOLDOWN = 900
+-- What the auction house keeps of a sale, in percent (5 at a faction auction house in every version of
+-- the game so far; unverified on Forever). One place to change it.
+L.AH_CUT_PERCENT = 5
+L.RING_MAX_SCANS = 12
+L.RING_MAX_BYTES = 8 * 1024 * 1024
+-- The server refuses a document with more rows than this (MAX_ROWS in src/shared/scan-schema.ts; a
+-- test holds the two together). The addon never saves one: see Export.save.
+L.MAX_ROWS = 250000
+-- The bake step does not decode a reference string longer than this (MAX_REF_BASE64_CHARS in
+-- src/shared/ref-doc.ts; a test holds the two together, tag included).
+L.REF_MAX_BYTES = 4 * 1024 * 1024
+
+-- The server refuses any number that is not a safe integer (2^53 - 1).
+local MAX_SAFE = 9007199254740991
+local FACTIONS = { Horde = true, Alliance = true, Neutral = true }
+
+-- A whole number in [min, 2^53). NaN and infinity fail the comparisons.
+local function isCount(v, min)
+    return type(v) == "number" and v >= min and v <= MAX_SAFE and v % 1 == 0
+end
+
+-- A whole number of either sign.
+local function isInt(v)
+    return type(v) == "number" and v >= -MAX_SAFE and v <= MAX_SAFE and v % 1 == 0
+end
+
+local function countOr0(v)
+    if isCount(v, 0) then return v end
+    return 0
+end
+
+-- 16 lowercase hex characters
+local function isUid(v)
+    return type(v) == "string" and #v == 16 and string.match(v, "^[0-9a-f]+$") ~= nil
+end
+
+---------------------------------------------------------------------------------------------------
+-- Item links and scan ids
+---------------------------------------------------------------------------------------------------
+
+-- "|Hitem:6292::::::1234:..." -> 1234. The suffix id is the 7th field after "item:"
+-- (itemID, enchant, four gems, suffix). No link, no match or an empty field -> 0. May be negative.
+function L.parseSuffix(link)
+    if type(link) ~= "string" then return 0 end
+    local field = string.match(link, "item:%-?%d+:[^:|]*:[^:|]*:[^:|]*:[^:|]*:[^:|]*:%s*(%-?%d+)")
+    if not field then return 0 end
+    local n = tonumber(field)
+    if not isInt(n) or n == 0 then return 0 end
+    return n
+end
+
+local HEX = "0123456789abcdef"
+
+-- 8 lowercase hex digits of n modulo 2^32, by hand: "%x" goes through a C long, which is 32 bits
+-- on Windows, and this must not depend on that.
+local function hex8(n)
+    if type(n) ~= "number" or n ~= n or n < 0 or n == math.huge then n = 0 end
+    n = math.floor(n) % 4294967296
+    local out = ""
+    for _ = 1, 8 do
+        local digit = n % 16
+        out = string.sub(HEX, digit + 1, digit + 1) .. out
+        n = (n - digit) / 16
+    end
+    return out
+end
+
+-- 16 lowercase hex characters: the server time, then a random number in [0, 2^31).
+function L.newUid(serverTime, rand)
+    return hex8(serverTime) .. hex8(rand)
+end
+
+-- A random whole number in [0, 2^31). Two small draws: math.random(0, 2^31 - 1) overflows a C int
+-- inside Lua 5.1.
+function L.rand31()
+    return math.random(0, 65535) * 32768 + math.random(0, 32767)
+end
+
+---------------------------------------------------------------------------------------------------
+-- Guards
+---------------------------------------------------------------------------------------------------
+
+-- The cooldown self-guard. -> true, 0   or   false, secondsRemaining
+function L.canReplicate(now, lastAt, cooldown)
+    if type(now) ~= "number" or type(lastAt) ~= "number" or lastAt <= 0 then return true, 0 end
+    local elapsed = now - lastAt
+    -- Saved state is not to be trusted blindly: a time far in the future is not one this addon
+    -- wrote. A time slightly ahead (clock skew) counts as "just scanned".
+    if elapsed < -cooldown then return true, 0 end
+    if elapsed < 0 then elapsed = 0 end
+    if elapsed >= cooldown then return true, 0 end
+    return false, cooldown - elapsed
+end
+
+-- nil when the realm / faction / build are good enough to label a scan, else what is wrong.
+function L.metaProblem(meta)
+    if type(meta) ~= "table" then return "the client did not report a realm" end
+    if type(meta.realm) ~= "string" or meta.realm == "" or #meta.realm > 64 then
+        return "the client did not report a usable realm name"
+    end
+    if not FACTIONS[meta.faction] then return "the client did not report a faction" end
+    if type(meta.build) ~= "string" or meta.build == "" or #meta.build > 64 then
+        return "the client did not report a build number"
+    end
+    return nil
+end
+
+---------------------------------------------------------------------------------------------------
+-- Aggregation: (itemID, suffixID, stackCount, stackBuyout) -> number of auctions
+---------------------------------------------------------------------------------------------------
+
+local Agg = {}
+Agg.__index = Agg
+
+function L.newAggregator()
+    return setmetatable({
+        rowCount = 0, -- every row handed to add()
+        bidOnly = 0,  -- rows with buyout 0: counted, not recorded
+        noLink = 0,   -- recorded rows whose item link was missing (suffix recorded as 0)
+        invalid = 0,  -- rows the server would refuse: counted, not recorded
+        tree = {},    -- itemID -> suffixID -> count -> buyout -> row
+        list = {},
+        keys = 0,
+    }, Agg)
+end
+
+-- The buyout is stored exactly as the client gave it: per stack or per unit is the server's call,
+-- and nothing here ever divides it by the count.
+function Agg:add(itemID, suffixID, count, buyout, hadLink)
+    self.rowCount = self.rowCount + 1
+    if buyout == 0 then
+        self.bidOnly = self.bidOnly + 1
+        return
+    end
+    if not (isCount(itemID, 1) and isCount(count, 1) and isCount(buyout, 1)) then
+        self.invalid = self.invalid + 1
+        return
+    end
+    if not isInt(suffixID) then suffixID = 0 end
+    if not hadLink then self.noLink = self.noLink + 1 end
+
+    local bySuffix = self.tree[itemID]
+    if not bySuffix then
+        bySuffix = {}
+        self.tree[itemID] = bySuffix
+    end
+    local byCount = bySuffix[suffixID]
+    if not byCount then
+        byCount = {}
+        bySuffix[suffixID] = byCount
+        self.keys = self.keys + 1
+    end
+    local byBuyout = byCount[count]
+    if not byBuyout then
+        byBuyout = {}
+        byCount[count] = byBuyout
+    end
+    local row = byBuyout[buyout]
+    if row then
+        row[5] = row[5] + 1
+    else
+        row = { itemID, suffixID, count, buyout, 1 }
+        byBuyout[buyout] = row
+        self.list[#self.list + 1] = row
+    end
+end
+
+local function rowBefore(a, b)
+    for i = 1, 4 do
+        if a[i] ~= b[i] then return a[i] < b[i] end
+    end
+    return false
+end
+
+-- -> array of { itemID, suffixID, count, buyout, n }, sorted by itemID, suffixID, count, buyout
+function Agg:rows()
+    local out = {}
+    for i = 1, #self.list do out[i] = self.list[i] end
+    table.sort(out, rowBefore)
+    return out
+end
+
+-- distinct (itemID, suffixID)
+function Agg:keyCount()
+    return self.keys
+end
+
+---------------------------------------------------------------------------------------------------
+-- Browse results
+---------------------------------------------------------------------------------------------------
+
+-- array of { itemKey = { itemID, itemLevel, itemSuffix }, minPrice, totalQuantity }
+--   -> array of { itemID, itemLevel, itemSuffix, minPrice, totalQuantity }
+-- Rows with no item id or no price are skipped. No other field of a result is read.
+function L.browseRows(results)
+    local out = {}
+    if type(results) ~= "table" then return out end
+    for i = 1, #results do
+        local result = results[i]
+        local key = type(result) == "table" and result.itemKey
+        if type(key) == "table" and isCount(key.itemID, 1) and isCount(result.minPrice, 0) then
+            local suffix = key.itemSuffix
+            if not isInt(suffix) then suffix = 0 end
+            out[#out + 1] = { key.itemID, countOr0(key.itemLevel), suffix, result.minPrice, countOr0(result.totalQuantity) }
+        end
+    end
+    return out
+end
+
+-- -> { [itemID] = lowest minPrice across its variants }, prices above 0 only. For the tooltip.
+function L.priceTable(browseRows)
+    local prices = {}
+    if type(browseRows) ~= "table" then return prices end
+    for i = 1, #browseRows do
+        local row = browseRows[i]
+        local itemID, price = row[1], row[4]
+        if isCount(itemID, 1) and isCount(price, 1) and (prices[itemID] == nil or price < prices[itemID]) then
+            prices[itemID] = price
+        end
+    end
+    return prices
+end
+
+---------------------------------------------------------------------------------------------------
+-- The scan document (design spec section 5; src/shared/scan-schema.ts is the contract)
+---------------------------------------------------------------------------------------------------
+
+-- extra = { uid =, rowCount =, bidOnly =, noLink = }   (bidOnly / noLink: replicate only)
+-- A Lua table cannot hold a nil, so `copper` is simply absent when the client cannot say.
+function L.buildDoc(meta, kind, complete, t0, t1, rows, extra)
+    if type(meta) ~= "table" then meta = {} end
+    if type(extra) ~= "table" then extra = {} end
+    if type(rows) ~= "table" then rows = {} end
+    t0 = countOr0(t0)
+    t1 = countOr0(t1)
+    if t1 < t0 then t1 = t0 end
+
+    local uid = extra.uid
+    if not isUid(uid) then uid = L.newUid(t0, L.rand31()) end
+
+    local doc = {
+        schema = L.SCHEMA,
+        uid = uid,
+        kind = kind,
+        complete = complete and true or false,
+        t0 = t0,
+        t1 = t1,
+        region = countOr0(meta.region),
+        realm = type(meta.realm) == "string" and meta.realm or "",
+        faction = type(meta.faction) == "string" and meta.faction or "",
+        build = type(meta.build) == "string" and meta.build or "",
+        interface = countOr0(meta.interface),
+        addon = type(meta.addon) == "string" and meta.addon or L.VERSION,
+        rowCount = countOr0(extra.rowCount),
+        rows = rows,
+    }
+    if type(meta.copper) == "boolean" then doc.copper = meta.copper end
+    if kind == "replicate" then
+        doc.bidOnly = countOr0(extra.bidOnly)
+        doc.noLink = countOr0(extra.noLink)
+    end
+    return doc
+end
+
+---------------------------------------------------------------------------------------------------
+-- Chunks, the end sentinel and the ring
+---------------------------------------------------------------------------------------------------
+
+-- -> "j1:<uid>:<part>/<parts>:<b64>"   (concatenation, not "%s": the payload can be megabytes)
+function L.chunkTag(uid, part, parts, b64)
+    return "j1:" .. tostring(uid) .. ":" .. string.format("%d/%d", part, parts) .. ":" .. tostring(b64)
+end
+
+-- "j1:<uid>:<part>/<parts>:..." -> uid ; anything else -> nil
+function L.uidOf(chunk)
+    if type(chunk) ~= "string" then return nil end
+    local uid = string.match(chunk, "^j1:(%x+):%d+/%d+:")
+    if isUid(uid) then return uid end
+    return nil
+end
+
+-- Removes every "end:<n>" entry, in place. Anything else that is not a chunk goes too: the server
+-- counts chunk strings and compares with the sentinel, so a stray entry would get the whole file
+-- refused.
+function L.stripSentinel(chunks)
+    if type(chunks) ~= "table" then return {} end
+    local n = #chunks
+    local kept = 0
+    for i = 1, n do
+        local chunk = chunks[i]
+        if L.uidOf(chunk) then
+            kept = kept + 1
+            chunks[kept] = chunk
+        end
+    end
+    for i = kept + 1, n do chunks[i] = nil end
+    return chunks
+end
+
+-- stripSentinel, then appends "end:<number of chunk strings>". Safe to call any number of times.
+function L.appendSentinel(chunks)
+    chunks = L.stripSentinel(chunks)
+    chunks[#chunks + 1] = "end:" .. string.format("%d", #chunks)
+    return chunks
+end
+
+-- -> number of scans, bytes of chunk text
+function L.ringStats(chunks)
+    local scans, bytes = 0, 0
+    if type(chunks) ~= "table" then return scans, bytes end
+    local seen = {}
+    for i = 1, #chunks do
+        local uid = L.uidOf(chunks[i])
+        if uid then
+            bytes = bytes + #chunks[i]
+            if not seen[uid] then
+                seen[uid] = true
+                scans = scans + 1
+            end
+        end
+    end
+    return scans, bytes
+end
+
+local function dropUid(chunks, uid)
+    local n = #chunks
+    local kept = 0
+    for i = 1, n do
+        local chunk = chunks[i]
+        if L.uidOf(chunk) ~= uid then
+            kept = kept + 1
+            chunks[kept] = chunk
+        end
+    end
+    for i = kept + 1, n do chunks[i] = nil end
+end
+
+-- Appends newChunks (all the parts of one scan), then evicts whole scans from the front until both
+-- caps hold. The scan just added is never evicted. Leaves no sentinel: the caller seals the ring.
+-- -> chunks, evicted   (the uids that were pushed out, oldest first; the caller tells the player,
+-- because a scan that was never written to disk is gone for good)
+function L.ringPush(chunks, newChunks, maxScans, maxBytes)
+    chunks = L.stripSentinel(chunks)
+    local evicted = {}
+    if type(newChunks) ~= "table" then return chunks, evicted end
+    local newUid = L.uidOf(newChunks[1])
+    if not newUid then return chunks, evicted end
+    dropUid(chunks, newUid) -- the same scan twice would be refused by the server as a duplicate part
+    for i = 1, #newChunks do
+        if L.uidOf(newChunks[i]) == newUid then chunks[#chunks + 1] = newChunks[i] end
+    end
+    while true do
+        local scans, bytes = L.ringStats(chunks)
+        if scans <= maxScans and bytes <= maxBytes then break end
+        local oldest = L.uidOf(chunks[1])
+        if oldest == nil or oldest == newUid then break end
+        dropUid(chunks, oldest)
+        evicted[#evicted + 1] = oldest
+    end
+    return chunks, evicted
+end
+
+-- The server time a uid was made at (its first 8 hex digits), or nil. Digit by digit, like hex8:
+-- tonumber(text, 16) goes through a C integer whose width this must not depend on.
+function L.uidTime(uid)
+    if not isUid(uid) then return nil end
+    local n = 0.0 -- written as a float so that a Lua with 32-bit integers (the test VM) cannot wrap it
+    for i = 1, 8 do
+        n = n * 16 + (string.find(HEX, string.sub(uid, i, i), 1, true) - 1)
+    end
+    return n
+end
+
+---------------------------------------------------------------------------------------------------
+-- Saved state
+---------------------------------------------------------------------------------------------------
+
+-- Brings whatever was saved (possibly nothing: saved state does not survive a client restart) to
+-- the layout in design spec section 4. Reuses the saved table. Does not touch the sentinel.
+function L.initDB(db)
+    if type(db) ~= "table" then db = {} end
+    db.v = 1
+    if type(db.state) ~= "table" then db.state = {} end
+    if not isCount(db.state.lastReplicateAt, 0) then db.state.lastReplicateAt = 0 end
+    if not isCount(db.state.lastBrowseAt, 0) then db.state.lastBrowseAt = 0 end
+    if type(db.prices) ~= "table" then db.prices = {} end
+    if not isCount(db.pricesAt, 0) then db.pricesAt = 0 end
+    if type(db.chunks) ~= "table" then db.chunks = {} end
+    if type(db.recipes) ~= "table" then db.recipes = {} end
+    if type(db.vendor) ~= "table" then db.vendor = {} end
+    return db
+end
+
+---------------------------------------------------------------------------------------------------
+-- Crafting cost (tooltip line "Crafting Cost: ..."). Pure arithmetic on three tables the addon keeps:
+--   recipes[outputItemID] = { { recipeID =, qty = <items made>, mats = { {itemID, qty}, ... } }, ... }
+--   prices[itemID]        = cheapest auction unit price, from the last complete browse scan
+--   vendor[itemID]        = unit price at a vendor the player has visited; when known it always wins
+---------------------------------------------------------------------------------------------------
+
+local function validMats(mats)
+    if type(mats) ~= "table" or #mats == 0 then return false end
+    for i = 1, #mats do
+        local m = mats[i]
+        if type(m) ~= "table" or not isCount(m[1], 1) or not isCount(m[2], 1) then return false end
+    end
+    return true
+end
+
+-- What one unit of a mat costs: the VENDOR price whenever a vendor is known to sell it (unlimited supply at a
+-- fixed price - one cheap auction listing must not make a craft look cheaper than it is), otherwise the
+-- cheapest auction price; nil when neither is known.
+-- -> price, "vendor" | "ah"
+local function unitPrice(itemID, prices, vendor)
+    local shop = type(vendor) == "table" and vendor[itemID] or nil
+    if isCount(shop, 1) then return shop, "vendor" end
+    local ah = type(prices) == "table" and prices[itemID] or nil
+    if isCount(ah, 1) then return ah, "ah" end
+    return nil
+end
+
+-- -> total copper for the mats that have a price, how many mats have none, the cost of ONE item made.
+-- A mat with no price is never treated as free: it is left out of the total and counted.
+-- -> nil when the recipe cannot be priced at all (no mats, broken numbers).
+function L.craftingCost(recipe, prices, vendor)
+    if type(recipe) ~= "table" or not validMats(recipe.mats) then return nil end
+    local qty = isCount(recipe.qty, 1) and recipe.qty or 1
+    local total, missing = 0, 0
+    for i = 1, #recipe.mats do
+        local m = recipe.mats[i]
+        local price = (unitPrice(m[1], prices, vendor))
+        if price then total = total + price * m[2] else missing = missing + 1 end
+    end
+    return total, missing, math.ceil(total / qty)
+end
+
+-- The same sum, mat by mat, for the tooltip: { { itemID =, qty =, unit =, total =, source = "vendor" | "ah" }, ... }
+-- in recipe order. A mat with no price has no unit, total or source. The totals always add up to craftingCost.
+function L.costBreakdown(recipe, prices, vendor)
+    local rows = {}
+    if type(recipe) ~= "table" or not validMats(recipe.mats) then return rows end
+    for i = 1, #recipe.mats do
+        local m = recipe.mats[i]
+        local price, source = unitPrice(m[1], prices, vendor)
+        rows[i] = { itemID = m[1], qty = m[2], unit = price, total = price and price * m[2] or nil, source = source }
+    end
+    return rows
+end
+
+-- Crafting to sell: what the recipe makes, sold at the cheapest current listing, less the auction house's cut,
+-- less the mats. -> profit (negative = a loss), revenue after the cut
+-- -> nil when it would be a guess: a mat with no price (the cost is understated) or nobody selling the item.
+-- The deposit is left out: it comes back when the item sells.
+function L.craftingProfit(total, missing, qty, salePrice)
+    if not isCount(total, 0) or missing ~= 0 or not isCount(salePrice, 1) then return nil end
+    if not isCount(qty, 1) then qty = 1 end
+    local revenue = math.floor(salePrice * qty * (100 - L.AH_CUT_PERCENT) / 100)
+    return revenue - total, revenue
+end
+
+-- Several recipes can make the same item: prefer one whose mats are all priced, then the cheapest per item.
+-- -> recipeID, total, missing, perItem, recipe   (nil when there is nothing to choose from)
+function L.cheapestRecipe(recipes, prices, vendor)
+    local best
+    if type(recipes) ~= "table" then return nil end
+    for i = 1, #recipes do
+        local total, missing, each = L.craftingCost(recipes[i], prices, vendor)
+        if total and (not best or missing < best.missing or (missing == best.missing and each < best.each)) then
+            best = { id = recipes[i].recipeID, total = total, missing = missing, each = each, recipe = recipes[i] }
+        end
+    end
+    if not best then return nil end
+    return best.id, best.total, best.missing, best.each, best.recipe
+end
+
+-- Files one recipe under its output item; seeing the same recipe again replaces it. -> true when stored.
+function L.addRecipe(book, outputItemID, recipeID, qty, mats)
+    if type(book) ~= "table" or not isCount(outputItemID, 1) or not isCount(recipeID, 1) then return false end
+    if not isCount(qty, 1) or not validMats(mats) then return false end
+    local copy = {}
+    for i = 1, #mats do copy[i] = { mats[i][1], mats[i][2] } end
+    local entry = { recipeID = recipeID, qty = qty, mats = copy }
+    local list = book[outputItemID]
+    if type(list) ~= "table" then
+        list = {}
+        book[outputItemID] = list
+    end
+    for i = 1, #list do
+        if type(list[i]) == "table" and list[i].recipeID == recipeID then
+            list[i] = entry
+            return true
+        end
+    end
+    list[#list + 1] = entry
+    return true
+end
+
+-- One merchant row -> the copper price of ONE item, or nil when it is not a plain, always-available gold
+-- purchase (another currency, or limited stock that may not be there next time).
+function L.vendorUnitPrice(item)
+    if type(item) ~= "table" or item.hasExtendedCost == true then return nil end
+    if not isCount(item.price, 1) then return nil end
+    if item.numAvailable ~= nil and item.numAvailable ~= -1 then return nil end
+    local stack = isCount(item.stackCount, 1) and item.stackCount or 1
+    return math.ceil(item.price / stack)
+end
+
+-- recipes[outputItemID] lists -> { [recipeID] = entry }, { [recipeID] = outputItemID }.
+-- The profession window lists recipes, not items.
+function L.recipeIndex(book)
+    local index, outputs = {}, {}
+    if type(book) ~= "table" then return index, outputs end
+    for outputItemID, list in pairs(book) do
+        if type(list) == "table" then
+            for i = 1, #list do
+                local entry = list[i]
+                if type(entry) == "table" and isCount(entry.recipeID, 1) and validMats(entry.mats) then
+                    index[entry.recipeID] = entry
+                    if isCount(outputItemID, 1) then outputs[entry.recipeID] = outputItemID end
+                end
+            end
+        end
+    end
+    return index, outputs
+end
+
+---------------------------------------------------------------------------------------------------
+-- The profit summary of a whole profession (Summary.lua): the tooltip's numbers, one row per recipe.
+---------------------------------------------------------------------------------------------------
+
+-- recipeIDs: the open profession's recipes, in the game's order. index, outputs: from recipeIndex.
+-- -> rows { recipeID, itemID, qty, cost, missing, sale, profit, status = "profit" | "loss" | "unknown",
+--          why = "mats" | "nosale" }, counts { profit, loss, unknown }
+-- sale is what the recipe makes at the cheapest listing, before the cut; profit is after it. Breaking even is
+-- a profit. A recipe never read, or one that makes no item, is left out: there is nothing honest to say.
+function L.profitSummary(recipeIDs, index, outputs, prices, vendor)
+    local rows, counts = {}, { profit = 0, loss = 0, unknown = 0 }
+    if type(recipeIDs) ~= "table" or type(index) ~= "table" or type(outputs) ~= "table" then return rows, counts end
+    for i = 1, #recipeIDs do
+        local recipeID = recipeIDs[i]
+        local entry, itemID = index[recipeID], outputs[recipeID]
+        local cost, missing = L.craftingCost(entry, prices, vendor)
+        if cost and isCount(itemID, 1) then
+            local qty = isCount(entry.qty, 1) and entry.qty or 1
+            local row = { recipeID = recipeID, itemID = itemID, qty = qty, cost = cost, missing = missing }
+            local price = type(prices) == "table" and prices[itemID] or nil
+            local profit = L.craftingProfit(cost, missing, qty, price)
+            if profit then
+                row.sale, row.profit = price * qty, profit
+                row.status = profit >= 0 and "profit" or "loss"
+            else
+                row.status = "unknown"
+                row.why = missing > 0 and "mats" or "nosale"
+            end
+            counts[row.status] = counts[row.status] + 1
+            rows[#rows + 1] = row
+        end
+    end
+    return rows, counts
+end
+
+local SORT_KEYS = { profit = "number", cost = "number", sale = "number", name = "string" }
+
+-- Sorts in place and returns rows. A row with nothing under this key goes last in either direction; ties
+-- keep recipe order, so the list never shuffles between refreshes. An unknown key leaves the order alone.
+function L.sortSummary(rows, key, descending)
+    if type(rows) ~= "table" or not SORT_KEYS[key] then return rows end
+    local kind = SORT_KEYS[key]
+    local function value(row)
+        local v = row[key]
+        if type(v) ~= kind then return nil end
+        if kind == "string" then return string.lower(v) end
+        return v
+    end
+    table.sort(rows, function(a, b)
+        local va, vb = value(a), value(b)
+        if va ~= vb then
+            if va == nil then return false end
+            if vb == nil then return true end
+            if descending then return va > vb end
+            return va < vb
+        end
+        return (a.recipeID or 0) < (b.recipeID or 0)
+    end)
+    return rows
+end
+
+---------------------------------------------------------------------------------------------------
+-- Reference data. Saved data is never read back on this client (CLAUDE.md), so what never changes -
+-- vendor prices and recipes - leaves the game as one "reference document" in the saved file and comes
+-- back as addon code: Data.lua, written by the bake step (src/shared/bake.ts) and loaded like any
+-- other file of the addon. Learned this session always beats baked; baked only fills the gaps.
+---------------------------------------------------------------------------------------------------
+
+local function sortedKeys(tbl)
+    local keys = {}
+    for k in pairs(tbl) do
+        if isCount(k, 1) then keys[#keys + 1] = k end
+    end
+    table.sort(keys)
+    return keys
+end
+
+-- -> { schema, kind = "ref", at, addon, vendor = { {itemID, price}, ... }, recipes = { {outputItemID,
+-- recipeID, qty, { {itemID, qty}, ... }}, ... } }, both sorted; nil when there is nothing to tell.
+-- Arrays throughout: JSON has no numeric keys. src/shared/ref-doc.ts is the contract.
+function L.refDoc(db, at)
+    if type(db) ~= "table" then return nil end
+    local vendor, recipes = {}, {}
+    if type(db.vendor) == "table" then
+        local ids = sortedKeys(db.vendor)
+        for i = 1, #ids do
+            local price = db.vendor[ids[i]]
+            if isCount(price, 1) then vendor[#vendor + 1] = { ids[i], price } end
+        end
+    end
+    if type(db.recipes) == "table" then
+        local outputs = sortedKeys(db.recipes)
+        for i = 1, #outputs do
+            local byRecipe = L.recipeIndex({ db.recipes[outputs[i]] })
+            local recipeIDs = sortedKeys(byRecipe)
+            for j = 1, #recipeIDs do
+                local entry = byRecipe[recipeIDs[j]]
+                local mats = {}
+                for m = 1, #entry.mats do mats[m] = { entry.mats[m][1], entry.mats[m][2] } end
+                recipes[#recipes + 1] = { outputs[i], entry.recipeID, isCount(entry.qty, 1) and entry.qty or 1, mats }
+            end
+        end
+    end
+    if #vendor == 0 and #recipes == 0 then return nil end
+    return { schema = L.SCHEMA, kind = "ref", at = countOr0(at), addon = L.VERSION, vendor = vendor, recipes = recipes }
+end
+
+-- -> "r1:<b64>"   (its own tag: the scan extractor on the server only ever looks for "j1:" and "end:")
+function L.refTag(b64)
+    return "r1:" .. tostring(b64)
+end
+
+-- "r1:<b64>" -> b64 ; anything else -> nil
+function L.refOf(text)
+    if type(text) ~= "string" then return nil end
+    return string.match(text, "^r1:([A-Za-z0-9+/=]+)$")
+end
+
+-- Copies into db whatever the baked tables know and this session does not. -> vendor prices added, recipes added
+function L.applyBaked(db, baked)
+    local vendorAdded, recipesAdded = 0, 0
+    if type(db) ~= "table" or type(baked) ~= "table" then return vendorAdded, recipesAdded end
+    db = L.initDB(db)
+    if type(baked.vendor) == "table" then
+        for itemID, price in pairs(baked.vendor) do
+            if isCount(itemID, 1) and isCount(price, 1) and db.vendor[itemID] == nil then
+                db.vendor[itemID] = price
+                vendorAdded = vendorAdded + 1
+            end
+        end
+    end
+    if type(baked.recipes) == "table" then
+        local known = L.recipeIndex(db.recipes)
+        for outputItemID, list in pairs(baked.recipes) do
+            if type(list) == "table" then
+                for i = 1, #list do
+                    local entry = list[i]
+                    if type(entry) == "table" and known[entry.recipeID] == nil
+                        and L.addRecipe(db.recipes, outputItemID, entry.recipeID, entry.qty, entry.mats) then
+                        known[entry.recipeID] = true
+                        recipesAdded = recipesAdded + 1
+                    end
+                end
+            end
+        end
+    end
+    return vendorAdded, recipesAdded
+end
+
+---------------------------------------------------------------------------------------------------
+-- Formatting
+---------------------------------------------------------------------------------------------------
+
+-- 45 -> "45s", 600 -> "10m", 7200 -> "2h", 200000 -> "2d"
+function L.formatAge(seconds)
+    if type(seconds) ~= "number" or seconds ~= seconds or seconds < 0 then seconds = 0 end
+    if seconds == math.huge then return "?" end
+    if seconds < 60 then return string.format("%.0f", math.floor(seconds)) .. "s" end
+    if seconds < 3600 then return string.format("%.0f", math.floor(seconds / 60)) .. "m" end
+    if seconds < 86400 then return string.format("%.0f", math.floor(seconds / 3600)) .. "h" end
+    return string.format("%.0f", math.floor(seconds / 86400)) .. "d"
+end
+
+-- 123456 -> "12g 34s 56c"; 5000 -> "50s"; 0 -> "0c". Plain text, for clients without a coin formatter.
+-- "%.0f" and not "%d": a big gold figure does not fit the C long behind "%d" on Windows.
+function L.formatMoney(copper)
+    if not isCount(copper, 0) then copper = 0 end
+    local c = copper % 100
+    local s = ((copper - c) / 100) % 100
+    local g = (copper - c - s * 100) / 10000
+    local parts = {}
+    if g > 0 then parts[#parts + 1] = string.format("%.0f", g) .. "g" end
+    if s > 0 then parts[#parts + 1] = string.format("%.0f", s) .. "s" end
+    if c > 0 or #parts == 0 then parts[#parts + 1] = string.format("%.0f", c) .. "c" end
+    return table.concat(parts, " ")
+end
+
+return L

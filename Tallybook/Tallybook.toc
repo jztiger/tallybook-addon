@@ -1,0 +1,16 @@
+## Interface: 16001
+## Title: Tallybook
+## Notes: Auction house price notebook. Read-only: never posts, bids, buys or cancels. Scans only when you ask.
+## Author: jztiger
+## Version: 0.5.0
+## SavedVariables: TallybookDB
+
+Logic.lua
+Data.lua
+Core.lua
+Export.lua
+Scan.lua
+Craft.lua
+UI.lua
+List.lua
+Summary.lua
