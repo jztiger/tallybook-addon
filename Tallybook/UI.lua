@@ -241,6 +241,10 @@ function UI.status()
         ns.print(string.format("built-in data: %.0f vendor %s, %.0f %s, baked %s", bakedVendor,
             bakedVendor == 1 and "price" or "prices", bakedRecipes, bakedRecipes == 1 and "recipe" or "recipes",
             age(baked.builtAt, now)))
+    else
+        -- The empty Data.lua the addon ships with: nothing has replaced it yet. This is what a friend sees in the
+        -- minutes after installing, and saying nothing at all left them wondering whether it was working.
+        ns.print("built-in data: none yet - it arrives on its own once you have scanned and reloaded")
     end
     local ok, why = ns.Export.available()
     if not ok then ns.print(why) end

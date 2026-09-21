@@ -14,8 +14,11 @@ namespace Tallybook.Tray
         /// <summary>The folder the person picked. Never detected, never guessed (C4).</summary>
         public string WowFolder { get; set; } = "";
         public bool BringDataBack { get; set; } = true;
+        /// <summary>Install the addon when it is missing, and replace it when a newer version is published.</summary>
+        public bool KeepAddonUpToDate { get; set; } = true;
         public bool StartWithWindows { get; set; } = true;
-        public bool AcceptedNotice { get; set; }
+        /// <summary>Which version of the notice they accepted. 0 means they have not seen one.</summary>
+        public int AcceptedNoticeVersion { get; set; }
         public bool Paused { get; set; }
 
         /// <summary>Safe to log: no credential, no folder.</summary>

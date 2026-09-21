@@ -10,6 +10,8 @@ namespace Tallybook.Tray
     /// </summary>
     public static class GameFolders
     {
+        /// <summary>World of Warcraft: Forever's product folder - the game this addon is built for.</summary>
+        public const string BetaProduct = "_classic_beta_";
         public const string SavedName = "Tallybook.lua";
         public const string SavedBackupName = "Tallybook.lua.bak";
 
@@ -42,6 +44,32 @@ namespace Tallybook.Tray
                 if (File.Exists(file)) found.Add(file);
             }
             return found;
+        }
+
+/// <summary>Where the addon IS installed - a folder with our .toc in it. These are what an update replaces.</summary>
+        public static IReadOnlyList<string> AddonFolders(string wow)
+        {
+            var found = new List<string>();
+            foreach (string product in Products(wow))
+            {
+                string folder = Path.Combine(product, "Interface", "AddOns", "Tallybook");
+                if (File.Exists(Path.Combine(folder, "Tallybook.toc"))) found.Add(folder);
+            }
+            return found;
+        }
+
+        /// <summary>
+        /// Where a FIRST install goes, or null when it cannot be told. The addon is for one game, so it is never
+        /// put into a product folder on a guess: one product folder is unambiguous, and where there are several the
+        /// beta's own folder is the one this addon is built for. Anything else is left for the person to say.
+        /// </summary>
+        public static string? InstallTarget(string wow)
+        {
+            List<string> products = Products(wow);
+            string? pick = products.Count == 1
+                ? products[0]
+                : products.Find(p => string.Equals(Path.GetFileName(p), BetaProduct, StringComparison.OrdinalIgnoreCase));
+            return pick == null ? null : Path.Combine(pick, "Interface", "AddOns", "Tallybook");
         }
 
         /// <summary>The picked folder holds at least one product folder such as _classic_beta_.</summary>

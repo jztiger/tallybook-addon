@@ -1,7 +1,9 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Net.Http;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -21,6 +23,8 @@ namespace Tallybook.Tray
         private readonly NotifyIcon icon;
         private readonly ToolStripMenuItem pauseItem = new ToolStripMenuItem("Pause");
         private readonly ToolStripMenuItem updateItem = new ToolStripMenuItem("") { Visible = false };
+        /// <summary>What is installed, at the top of the menu: the tooltip has no room for it.</summary>
+        private readonly ToolStripMenuItem whatIsHere = new ToolStripMenuItem("") { Enabled = false };
         private readonly Timer timer = new Timer { Interval = 2000 };
         private bool busy;
         private bool forceNext;
@@ -37,12 +41,15 @@ namespace Tallybook.Tray
             cycle = new Cycle(config, client, new SentLog(Paths.Sent), new Stability(), log, () => DateTime.UtcNow);
 
             var menu = new ContextMenuStrip();
+            menu.Items.Add(whatIsHere);
+            menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Open Tallybook", null, (s, e) => OpenWebsite());
             menu.Items.Add(updateItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Upload now", null, (s, e) => { forceNext = true; });
             menu.Items.Add(pauseItem);
             menu.Items.Add("Settings...", null, (s, e) => ShowSettings());
+            menu.Items.Add("Reinstall the addon from GitHub", null, async (s, e) => await ReinstallAddon());
             menu.Items.Add("View log", null, (s, e) => OpenLog());
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Quit", null, (s, e) => Quit());
@@ -70,6 +77,7 @@ namespace Tallybook.Tray
                 forceNext = false;
                 CycleReport report = await Task.Run(() => cycle.RunAsync(force));
                 Show(report.State, report.Reason);
+                if (report.AddonInstalled != null) icon.ShowBalloonTip(5000, AppInfo.Name, "The Tallybook addon is now version " + report.AddonInstalled + ".", ToolTipIcon.Info);
 
                 if (!config.Paused && DateTime.UtcNow - versionCheckedUtc > TimeSpan.FromHours(24))
                 {
@@ -100,6 +108,8 @@ namespace Tallybook.Tray
             reason = newReason;
             icon.Icon = Icons.For(state);
             pauseItem.Text = config.Paused ? "Resume" : "Pause";
+            string? addon = AddonVersionHere();
+            whatIsHere.Text = "Tallybook " + AppInfo.Version + (addon == null ? "" : "  ·  addon " + addon);
 
             string text;
             if (state == TrayState.Ok)
@@ -180,6 +190,65 @@ namespace Tallybook.Tray
             catch (Exception e) when (e is System.ComponentModel.Win32Exception || e is InvalidOperationException || e is FileNotFoundException)
             {
                 log.Write("could not open it: " + e.GetType().Name);
+            }
+        }
+
+        /// <summary>The version installed in the game folder, or null when the addon is not there.</summary>
+        private string? AddonVersionHere()
+        {
+            foreach (string folder in GameFolders.AddonFolders(config.WowFolder))
+            {
+                string? v = AddonInstaller.InstalledVersion(folder);
+                if (v != null) return v;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Puts the addon back from the code published for anyone to read, WITHOUT asking our server. This is the
+        /// way out if the server ever served something wrong, so it deliberately goes straight to GitHub.
+        /// </summary>
+        private async Task ReinstallAddon()
+        {
+            DialogResult go = MessageBox.Show(
+                "This replaces the Tallybook addon with the code published on GitHub, without asking the server.\n\n"
+                    + "Your own prices are kept. Carry on?",
+                AppInfo.Name, MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
+            if (go != DialogResult.OK) return;
+
+            try
+            {
+                AddonManifest? published;
+                using (HttpClientHandler handler = ServerClient.CreateHandler())
+                {
+                    published = await Task.Run(() => PublicAddon.FetchAsync(handler));
+                }
+                if (published == null)
+                {
+                    log.Write("the published addon could not be read");
+                    MessageBox.Show("The published addon could not be read just now. Try again later.", AppInfo.Name, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                var folders = new List<string>(GameFolders.AddonFolders(config.WowFolder));
+                if (folders.Count == 0)
+                {
+                    string? fresh = GameFolders.InstallTarget(config.WowFolder);
+                    if (fresh != null) folders.Add(fresh);
+                }
+                if (folders.Count == 0)
+                {
+                    MessageBox.Show("There is no game folder here to install the addon into.", AppInfo.Name, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+                foreach (string folder in folders) log.Write("from GitHub: " + AddonInstaller.Install(folder, published));
+                Show(state, reason);
+                MessageBox.Show("The addon is back, at version " + published.Version + ".", AppInfo.Name, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception e)
+            {
+                log.Write("the reinstall failed: " + e.GetType().Name);
+                MessageBox.Show("The addon could not be put back: " + e.Message, AppInfo.Name, MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 

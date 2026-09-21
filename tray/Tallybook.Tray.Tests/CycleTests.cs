@@ -20,24 +20,57 @@ namespace Tallybook.Tray.Tests
         public readonly string DataLua;
         public readonly string LogFile;
         public string Lua = ServerClientTests.GoodLua;
+        public string AddonVersion = "0.9.0";
+        public string AddonETag = "\"addon1\"";
+        public int AddonStatus = 200;
+        public int AddonRequests;
         public string ETag = "\"v1\"";
         public int IngestStatus = 200;
         public Cycle Cycle;
 
-        public World()
+        /// <summary>A manifest in the shape the server sends: a .toc with that version, and one Lua file.</summary>
+        public static string AddonJson(string version)
+        {
+            string toc = "## Interface: 16001\n## Title: Tallybook\n## Version: " + version + "\n\nLogic.lua\nData.lua\n";
+            string logic = "local _, ns = ...\n-- " + version + "\n";
+            string empty = "-- GENERATED\nns.baked = {\n}\n";
+            string One(string n, string c) => "{\"name\":\"" + n + "\",\"sha256\":\"" + AddonManifest.Hash(c) + "\",\"content\":" + Quote(c) + "}";
+            return "{\"version\":\"" + version + "\",\"files\":[" + One("Tallybook.toc", toc) + "," + One("Logic.lua", logic) + "," + One("Data.lua", empty) + "]}";
+        }
+
+        private static string Quote(string s) => "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n") + "\"";
+
+        public World(bool addonInstalled = true)
         {
             Wow = Path.Combine(Dir.Path, "World of Warcraft");
             Saved = Path.Combine(Wow, "_classic_beta_", "WTF", "Account", "ACCT#1", "SavedVariables", "Tallybook.lua");
             DataLua = Path.Combine(Wow, "_classic_beta_", "Interface", "AddOns", "Tallybook", "Data.lua");
             LogFile = Dir.File("log.txt");
             Directory.CreateDirectory(Path.GetDirectoryName(Saved)!);
-            Directory.CreateDirectory(Path.GetDirectoryName(DataLua)!);
-            File.WriteAllText(DataLua, "-- the empty one\nns.baked = {\n}\n");
+            if (addonInstalled)
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(DataLua)!);
+                File.WriteAllText(DataLua, "-- the empty one\nns.baked = {\n}\n");
+                File.WriteAllText(Path.Combine(Path.GetDirectoryName(DataLua)!, "Tallybook.toc"), "## Version: 0.9.0\n\nLogic.lua\nData.lua\n");
+            }
+            else
+            {
+                Directory.CreateDirectory(Path.Combine(Wow, "_classic_beta_", "Interface", "AddOns"));
+            }
             Config.WowFolder = Wow;
-            Config.AcceptedNotice = true;
+            Config.AcceptedNoticeVersion = 2;
             Server.Answer = r =>
             {
                 if (r.Url.EndsWith("/api/v1/ingest", StringComparison.Ordinal)) return FakeServer.Status(IngestStatus, "{}", IngestStatus == 429 ? "120" : null);
+                if (r.Url.EndsWith("/api/v1/addon", StringComparison.Ordinal))
+                {
+                    AddonRequests++;
+                    if (AddonStatus != 200) return FakeServer.Status(AddonStatus, "{}");
+                    if (r.Headers.TryGetValue("If-None-Match", out string? a) && a == AddonETag) return FakeServer.Status(304, "");
+                    var m = FakeServer.Status(200, AddonJson(AddonVersion));
+                    m.Headers.TryAddWithoutValidation("ETag", AddonETag);
+                    return m;
+                }
                 if (r.Headers.TryGetValue("If-None-Match", out string? tag) && tag == ETag) return FakeServer.Status(304, "");
                 var ok = FakeServer.Status(200, Lua);
                 ok.Headers.TryAddWithoutValidation("ETag", ETag);
@@ -260,9 +293,13 @@ namespace Tallybook.Tray.Tests
             Directory.CreateDirectory(otherProduct); // the addon is not installed there
             await w.Cycle.RunAsync(false);
 
+            // A Forever addon has no business in somebody's retail game: a first install never guesses a product.
             Assert.False(Directory.Exists(Path.Combine(otherProduct, "Tallybook")));
-            string[] inAddon = Directory.GetFiles(Path.GetDirectoryName(w.DataLua)!).Select(Path.GetFileName).ToArray()!;
-            Assert.Equal(new[] { "Data.lua" }, inAddon);
+            string addon = Path.GetDirectoryName(w.DataLua)!;
+            string[] inAddon = Directory.GetFiles(addon).Select(Path.GetFileName).OrderBy(n => n, StringComparer.Ordinal).ToArray()!;
+            Assert.Equal(new[] { "Data.lua", "Tallybook.toc" }, inAddon); // what was installed, and nothing more
+            Assert.Empty(Directory.GetDirectories(addon));
+            Assert.DoesNotContain(Directory.GetDirectories(Path.GetDirectoryName(addon)!), d => Path.GetFileName(d)!.Contains(".new-") || Path.GetFileName(d)!.Contains(".old-"));
         }
 
         [Fact]
@@ -284,6 +321,104 @@ namespace Tallybook.Tray.Tests
             Assert.DoesNotContain(ServerClientTests.Secret, log);
             Assert.DoesNotContain(ServerClientTests.Key, log);
             Assert.DoesNotContain("ACCT#1", log);
+        }
+    }
+
+    public class AddonCycleTests
+    {
+        [Fact]
+        public async Task With_no_addon_installed_a_pass_installs_it_AND_THEN_fills_its_Data_lua()
+        {
+            using var w = new World(addonInstalled: false);
+            string addon = Path.GetDirectoryName(w.DataLua)!;
+            Assert.False(Directory.Exists(addon));
+
+            CycleReport r = await w.Cycle.RunAsync(false);
+
+            Assert.Equal("0.9.0", r.AddonInstalled);
+            Assert.Equal("0.9.0", AddonInstaller.InstalledVersion(addon));
+            // The order is what matters: an addon installed with the manifest's empty Data.lua would have no prices
+            // until the next fetch. It is filled in the same pass.
+            Assert.Equal(ServerClientTests.GoodLua, File.ReadAllText(w.DataLua));
+            Assert.Equal(1, r.Wrote);
+        }
+
+        [Fact]
+        public async Task A_half_there_addon_folder_is_repaired_and_the_prices_in_it_are_kept()
+        {
+            // Data.lua but no .toc: what a half-finished manual install, or a deleted file, leaves behind. The
+            // rehearsal was set up this way before the tray app installed addons, and it must still come good.
+            using var w = new World(addonInstalled: false);
+            string addon = Path.GetDirectoryName(w.DataLua)!;
+            Directory.CreateDirectory(addon);
+            File.WriteAllText(w.DataLua, "-- mine\nns.baked = { prices = { [2589] = 160 } }\n");
+            string mine = File.ReadAllText(w.DataLua);
+            w.Save("TallybookDB = { one = 1 }");
+
+            // The repair happens on the first pass - the saved file is not quiet enough to send yet.
+            CycleReport first = await w.Cycle.RunAsync(false);
+            Assert.Equal("0.9.0", first.AddonInstalled);
+            w.Now = w.Now.AddSeconds(4);
+            CycleReport then = await w.Cycle.RunAsync(false);
+
+            Assert.Equal(TrayState.Ok, then.State);
+            Assert.Equal(1, then.Uploaded);
+            Assert.Equal("0.9.0", AddonInstaller.InstalledVersion(addon));
+            Assert.Equal(ServerClientTests.GoodLua, File.ReadAllText(w.DataLua)); // the server's file, written after
+            Assert.NotEqual(mine, File.ReadAllText(w.DataLua));
+        }
+
+        [Fact]
+        public async Task The_version_already_installed_is_not_installed_again()
+        {
+            using var w = new World();
+            CycleReport first = await w.Cycle.RunAsync(false);
+            Assert.Null(first.AddonInstalled);
+            int asked = w.AddonRequests;
+
+            w.Now = w.Now.AddMinutes(5);
+            await w.Cycle.RunAsync(false);
+            Assert.Equal(asked, w.AddonRequests); // not asked again so soon
+        }
+
+        [Fact]
+        public async Task A_newer_addon_is_installed_and_the_players_prices_come_across_it()
+        {
+            using var w = new World();
+            await w.Cycle.RunAsync(false);
+            File.WriteAllText(w.DataLua, "-- mine\nns.baked = { prices = { [2589] = 160 } }\n");
+            string mine = File.ReadAllText(w.DataLua);
+
+            w.AddonVersion = "1.0.0";
+            w.AddonETag = "\"addon2\"";
+            w.Lua = "-- GENERATED\nns.baked = {\n    pricesAt = 1790000000,\n}\n"; // nothing new to write back yet
+            CycleReport r = await w.Cycle.RunAsync(true);
+
+            Assert.Equal("1.0.0", r.AddonInstalled);
+            Assert.Equal("1.0.0", AddonInstaller.InstalledVersion(Path.GetDirectoryName(w.DataLua)!));
+            Assert.Contains("[2589] = 160", File.ReadAllText(w.DataLua) + mine); // the prices were not thrown away
+        }
+
+        [Fact]
+        public async Task Switched_off_it_never_asks_for_the_addon_at_all()
+        {
+            using var w = new World();
+            w.Config.KeepAddonUpToDate = false;
+            await w.Cycle.RunAsync(true);
+            Assert.Equal(0, w.AddonRequests);
+        }
+
+        [Fact]
+        public async Task An_addon_the_server_cannot_offer_changes_nothing_and_the_upload_still_happens()
+        {
+            using var w = new World { AddonStatus = 503 };
+            w.Save("TallybookDB = { one = 1 }");
+            CycleReport r = await w.RunUntilStable();
+
+            Assert.Equal(1, r.Uploaded);
+            Assert.Null(r.AddonInstalled);
+            Assert.Equal("0.9.0", AddonInstaller.InstalledVersion(Path.GetDirectoryName(w.DataLua)!)); // untouched
+            Assert.Equal(TrayState.Ok, r.State);
         }
     }
 

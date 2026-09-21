@@ -231,6 +231,74 @@ namespace Tallybook.Tray.Tests
         }
     }
 
+    public class AddonFetchTests
+    {
+        private const string Manifest =
+            "{\"version\":\"0.9.0\",\"files\":[{\"name\":\"Tallybook.toc\",\"sha256\":\"SHA\",\"content\":\"TOC\"}]}";
+
+        private static string Body()
+        {
+            const string toc = "## Version: 0.9.0\n";
+            return Manifest.Replace("SHA", AddonManifest.Hash(toc)).Replace("TOC", "## Version: 0.9.0\\n");
+        }
+
+        [Fact]
+        public async Task The_addon_comes_back_parsed_with_its_etag_and_a_304_means_nothing_new()
+        {
+            var server = new FakeServer
+            {
+                Answer = r =>
+                {
+                    if (r.Headers.TryGetValue("If-None-Match", out string? tag) && tag == "\"a1\"") return FakeServer.Status(304, "");
+                    var ok = FakeServer.Status(200, Body());
+                    ok.Headers.TryAddWithoutValidation("ETag", "\"a1\"");
+                    return ok;
+                },
+            };
+            var client = new ServerClient(ServerClientTests.Config(), server);
+
+            var first = await client.FetchAddonAsync(null);
+            Assert.Equal(FetchResult.Changed, first.result);
+            Assert.Equal("0.9.0", first.manifest!.Version);
+            Assert.Equal("Tallybook.toc", Assert.Single(first.manifest.Files).Name);
+            Assert.Null(AddonManifest.Reject(first.manifest));
+            Assert.Equal("\"a1\"", first.etag);
+            Assert.Equal("https://tally-api.example.com/api/v1/addon", server.Requests[0].Url);
+            Assert.Equal("Bearer " + ServerClientTests.Key, server.Requests[0].Headers["Authorization"]);
+            Assert.False(server.Requests[0].Headers.ContainsKey("If-None-Match"));
+
+            var second = await client.FetchAddonAsync(first.etag);
+            Assert.Equal(FetchResult.NotModified, second.result);
+            Assert.Null(second.manifest);
+        }
+
+        [Theory]
+        [InlineData("<!DOCTYPE html><html>Just a moment...</html>")]
+        [InlineData("")]
+        [InlineData("{\"version\":\"0.9.0\",\"files\":[]}")]
+        [InlineData("{\"version\":\"0.9.0\",\"files\":[{\"name\":\"../evil.lua\",\"sha256\":\"x\",\"content\":\"y\"}]}")]
+        public async Task What_is_not_an_addon_we_would_install_is_invalid_and_never_handed_on(string body)
+        {
+            var server = new FakeServer { Answer = _ => FakeServer.Status(200, body) };
+            var got = await new ServerClient(ServerClientTests.Config(), server).FetchAddonAsync(null);
+            Assert.Equal(FetchResult.Invalid, got.result);
+            Assert.Null(got.manifest);
+        }
+
+        [Theory]
+        [InlineData(401, FetchResult.Refused)]
+        [InlineData(403, FetchResult.Refused)]
+        [InlineData(302, FetchResult.Refused)]
+        [InlineData(503, FetchResult.Failed)]
+        [InlineData(500, FetchResult.Failed)]
+        public async Task Answers(int status, FetchResult expected)
+        {
+            var server = new FakeServer { Answer = _ => FakeServer.Status(status) };
+            var got = await new ServerClient(ServerClientTests.Config(), server).FetchAddonAsync(null);
+            Assert.Equal(expected, got.result);
+        }
+    }
+
     public class BackoffTests
     {
         [Fact]

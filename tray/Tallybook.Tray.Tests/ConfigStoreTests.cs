@@ -91,7 +91,7 @@ namespace Tallybook.Tray.Tests
             TrayConfig c = ConfigStore.ImportDownload(Download)!;
             Assert.True(c.BringDataBack);
             Assert.True(c.StartWithWindows);
-            Assert.False(c.AcceptedNotice);
+            Assert.Equal(0, c.AcceptedNoticeVersion);
             Assert.False(c.Paused);
             Assert.Equal("", c.WowFolder);
         }
@@ -103,7 +103,7 @@ namespace Tallybook.Tray.Tests
             string path = dir.File("config.json");
             TrayConfig c = ConfigStore.ImportDownload(Download)!;
             c.WowFolder = @"D:\Games\World of Warcraft";
-            c.AcceptedNotice = true;
+            c.AcceptedNoticeVersion = 2;
             c.BringDataBack = false;
             ConfigStore.Save(path, c, new FakeProtector());
 
@@ -118,7 +118,7 @@ namespace Tallybook.Tray.Tests
             Assert.Equal("s3cr3t-client-secret", back!.ClientSecret);
             Assert.Equal("upl0ad-key-43-chars", back.UploadKey);
             Assert.Equal(@"D:\Games\World of Warcraft", back.WowFolder);
-            Assert.True(back.AcceptedNotice);
+            Assert.Equal(2, back.AcceptedNoticeVersion);
             Assert.False(back.BringDataBack);
             Assert.True(back.StartWithWindows);
         }
@@ -148,7 +148,7 @@ namespace Tallybook.Tray.Tests
         {
             TrayConfig mine = ConfigStore.ImportDownload(Download)!;
             mine.WowFolder = @"D:\Games\World of Warcraft";
-            mine.AcceptedNotice = true;
+            mine.AcceptedNoticeVersion = 2;
             mine.BringDataBack = false;
             mine.StartWithWindows = false;
             mine.Paused = true;
@@ -162,7 +162,7 @@ namespace Tallybook.Tray.Tests
             Assert.Equal(fresh.Ui, mine.Ui);
             Assert.Equal(fresh.ClientId, mine.ClientId);
             Assert.Equal(@"D:\Games\World of Warcraft", mine.WowFolder);
-            Assert.True(mine.AcceptedNotice);
+            Assert.Equal(2, mine.AcceptedNoticeVersion);
             Assert.False(mine.BringDataBack);
             Assert.False(mine.StartWithWindows);
             Assert.True(mine.Paused);
@@ -173,6 +173,45 @@ namespace Tallybook.Tray.Tests
         {
             string json = Download.Replace("{\n", "{\n  \"somethingNew\": 5,\n");
             Assert.NotNull(ConfigStore.ImportDownload(json));
+        }
+
+        [Fact]
+        public void A_config_written_before_the_notice_had_versions_counts_as_having_accepted_version_1()
+        {
+            using var dir = new TempDir();
+            string path = dir.File("config.json");
+            // Exactly what an older build wrote: a bare "acceptedNotice": true, and no version at all.
+            var p = new FakeProtector();
+            File.WriteAllText(path,
+                "{\"api\":\"https://tally-api.example.com\",\"ui\":\"https://tally.example.com\",\"clientId\":\"id\","
+                + "\"clientSecret\":\"p1:" + p.Protect("s") + "\",\"uploadKey\":\"p1:" + p.Protect("k") + "\","
+                + "\"wowFolder\":\"D:\\\\Games\\\\WoW\",\"acceptedNotice\":true}");
+            TrayConfig? back = ConfigStore.Load(path, p);
+            Assert.NotNull(back);
+            Assert.Equal(1, back!.AcceptedNoticeVersion); // so a version 2 notice is shown to them once
+            Assert.Equal("D:\\Games\\WoW", back.WowFolder); // and nothing else about them is lost
+        }
+
+        [Theory]
+        [InlineData("Tallybook notice, version 2\n\nBefore you install", 2)]
+        [InlineData("Tallybook notice, version 11\n", 11)]
+        [InlineData("Before you install - please read this\n", 0)]
+        [InlineData("", 0)]
+        public void The_notice_carries_its_own_version(string text, int expected)
+        {
+            Assert.Equal(expected, Notice.VersionOf(text));
+        }
+
+        [Fact]
+        public void Keeping_the_addon_up_to_date_defaults_to_on_and_survives_a_round_trip()
+        {
+            using var dir = new TempDir();
+            string path = dir.File("config.json");
+            TrayConfig c = ConfigStore.ImportDownload(Download)!;
+            Assert.True(c.KeepAddonUpToDate);
+            c.KeepAddonUpToDate = false;
+            ConfigStore.Save(path, c, new FakeProtector());
+            Assert.False(ConfigStore.Load(path, new FakeProtector())!.KeepAddonUpToDate);
         }
 
         [Fact]

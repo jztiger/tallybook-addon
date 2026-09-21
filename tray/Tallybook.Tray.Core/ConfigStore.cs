@@ -24,8 +24,10 @@ namespace Tallybook.Tray
             [DataMember(Name = "uploadKey", Order = 5)] public string? UploadKey { get; set; }
             [DataMember(Name = "wowFolder", Order = 6, EmitDefaultValue = false)] public string? WowFolder { get; set; }
             [DataMember(Name = "bringDataBack", Order = 7, EmitDefaultValue = false)] public bool? BringDataBack { get; set; }
+            [DataMember(Name = "keepAddonUpToDate", Order = 12, EmitDefaultValue = false)] public bool? KeepAddonUpToDate { get; set; }
             [DataMember(Name = "startWithWindows", Order = 8, EmitDefaultValue = false)] public bool? StartWithWindows { get; set; }
             [DataMember(Name = "acceptedNotice", Order = 9, EmitDefaultValue = false)] public bool? AcceptedNotice { get; set; }
+            [DataMember(Name = "acceptedNoticeVersion", Order = 11, EmitDefaultValue = false)] public int? AcceptedNoticeVersion { get; set; }
             [DataMember(Name = "paused", Order = 10, EmitDefaultValue = false)] public bool? Paused { get; set; }
         }
 
@@ -70,8 +72,9 @@ namespace Tallybook.Tray
                 UploadKey = Sealed + protector.Protect(c.UploadKey),
                 WowFolder = c.WowFolder,
                 BringDataBack = c.BringDataBack,
+                KeepAddonUpToDate = c.KeepAddonUpToDate,
                 StartWithWindows = c.StartWithWindows,
-                AcceptedNotice = c.AcceptedNotice,
+                AcceptedNoticeVersion = c.AcceptedNoticeVersion,
                 Paused = c.Paused,
             };
             string? dir = Path.GetDirectoryName(path);
@@ -106,8 +109,10 @@ namespace Tallybook.Tray
             UploadKey = uploadKey,
             WowFolder = s.WowFolder ?? "",
             BringDataBack = s.BringDataBack ?? true,
+            KeepAddonUpToDate = s.KeepAddonUpToDate ?? true,
             StartWithWindows = s.StartWithWindows ?? true,
-            AcceptedNotice = s.AcceptedNotice ?? false,
+            // A config written before the notice had versions: what they accepted was version 1.
+            AcceptedNoticeVersion = s.AcceptedNoticeVersion ?? ((s.AcceptedNotice ?? false) ? 1 : 0),
             Paused = s.Paused ?? false,
         };
 

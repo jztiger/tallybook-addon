@@ -37,6 +37,8 @@ namespace Tallybook.Tray
     {
         /// <summary>A full market and every profession is about 0.4 MiB; anything near this is not our file.</summary>
         public const int MaxDataFileBytes = 8 * 1024 * 1024;
+        /// <summary>The manifest's own cap, with room for JSON's quoting on top of the addon's byte limit.</summary>
+        public const int MaxAddonBytes = 16 * 1024 * 1024;
         private const int DefaultRetryAfter = 60;
         private const int LongestRetryAfter = 86400;
 
@@ -110,6 +112,46 @@ namespace Tallybook.Tray
                 catch (Exception e) when (e is HttpRequestException || e is TaskCanceledException || e is IOException)
                 {
                     LastError = "data file failed: " + e.GetType().Name;
+                    return (FetchResult.Failed, null, null);
+                }
+            }
+        }
+
+        /// <summary>
+        /// The addon the server has on offer. It is handed to <see cref="AddonInstaller"/>, which writes into the
+        /// game folder, so a manifest that <see cref="AddonManifest.Reject"/> will not have is Invalid here - it
+        /// never reaches the caller at all.
+        /// </summary>
+        public async Task<(FetchResult result, AddonManifest? manifest, string? etag)> FetchAddonAsync(string? etag)
+        {
+            using (var request = Request(HttpMethod.Get, "/api/v1/addon"))
+            {
+                if (!string.IsNullOrEmpty(etag)) request.Headers.TryAddWithoutValidation("If-None-Match", etag);
+                try
+                {
+                    using (HttpResponseMessage response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false))
+                    {
+                        int status = (int)response.StatusCode;
+                        LastError = status == 200 || status == 304 ? "" : "the addon answered " + status;
+                        if (status == 304) return (FetchResult.NotModified, null, etag);
+                        if (IsRefusal(status)) return (FetchResult.Refused, null, null);
+                        if (status != 200) return (FetchResult.Failed, null, null);
+
+                        byte[]? body = await ReadCapped(response.Content, MaxAddonBytes).ConfigureAwait(false);
+                        AddonManifest? manifest = body == null ? null : Json.Read<AddonManifest>(Encoding.UTF8.GetString(body));
+                        string? why = AddonManifest.Reject(manifest);
+                        if (why != null)
+                        {
+                            LastError = "the addon on offer was refused: " + why;
+                            return (FetchResult.Invalid, null, null);
+                        }
+                        string? tag = response.Headers.TryGetValues("ETag", out IEnumerable<string>? tags) ? tags.FirstOrDefault() : null;
+                        return (FetchResult.Changed, manifest, tag);
+                    }
+                }
+                catch (Exception e) when (e is HttpRequestException || e is TaskCanceledException || e is IOException)
+                {
+                    LastError = "the addon failed: " + e.GetType().Name;
                     return (FetchResult.Failed, null, null);
                 }
             }

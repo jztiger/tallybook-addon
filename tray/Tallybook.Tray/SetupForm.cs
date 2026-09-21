@@ -17,6 +17,7 @@ namespace Tallybook.Tray
         private readonly CheckBox understand = new CheckBox { AutoSize = true, Text = "I have read this and I understand the risk" };
         private readonly CheckBox startWithWindows = new CheckBox { AutoSize = true, Text = "Start with Windows" };
         private readonly CheckBox bringDataBack = new CheckBox { AutoSize = true, Text = "Bring data back (write the shared Data.lua into the Tallybook addon's folder)" };
+        private readonly CheckBox keepAddon = new CheckBox { AutoSize = true, Text = "Keep the Tallybook addon installed and up to date" };
         private readonly Button ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Width = 90 };
 
         /// <summary>Settings only: the credentials of a settings file the person loaded here; null when they did not.</summary>
@@ -30,13 +31,13 @@ namespace Tallybook.Tray
             MaximizeBox = false;
             MinimizeBox = false;
             ShowInTaskbar = true;
-            ClientSize = new Size(640, 560);
+            ClientSize = new Size(640, 590);
             Font = SystemFonts.MessageBoxFont;
 
             var notice = new TextBox
             {
                 Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, WordWrap = true,
-                Text = Notice().Replace("\r\n", "\n").Replace("\n", "\r\n"),
+                Text = NoticeText().Replace("\r\n", "\n").Replace("\n", "\r\n"),
                 Location = new Point(12, 12), Size = new Size(616, 300), TabStop = false, BackColor = SystemColors.Window,
             };
             notice.Select(0, 0);
@@ -50,18 +51,20 @@ namespace Tallybook.Tray
             folderHint.Location = new Point(12, 374);
 
             understand.Location = new Point(12, 404);
-            understand.Checked = config.AcceptedNotice;
+            understand.Checked = config.AcceptedNoticeVersion > 0;
             startWithWindows.Location = new Point(12, 436);
             startWithWindows.Checked = config.StartWithWindows;
             bringDataBack.Location = new Point(12, 464);
             bringDataBack.Checked = config.BringDataBack;
+            keepAddon.Location = new Point(12, 492);
+            keepAddon.Checked = config.KeepAddonUpToDate;
 
             if (!firstRun)
             {
                 // After a new download on the website (each one retires the key before it) the running copy is refused
                 // and turns red; this is how it is given the new file without hunting for the folder it lives in.
-                var load = new Button { Text = "Load new settings file...", Location = new Point(12, 520), Width = 190 };
-                var loaded = new Label { AutoSize = true, Location = new Point(210, 525), ForeColor = Color.SeaGreen };
+                var load = new Button { Text = "Load new settings file...", Location = new Point(12, 548), Width = 190 };
+                var loaded = new Label { AutoSize = true, Location = new Point(210, 553), ForeColor = Color.SeaGreen };
                 load.Click += (s, e) =>
                 {
                     TrayConfig? fresh = SettingsFile.Pick(this, new TrayLog(Paths.Log));
@@ -73,13 +76,13 @@ namespace Tallybook.Tray
                 Controls.Add(loaded);
             }
 
-            ok.Location = new Point(442, 520);
-            var cancel = new Button { Text = firstRun ? "Quit" : "Cancel", DialogResult = DialogResult.Cancel, Width = 90, Location = new Point(538, 520) };
+            ok.Location = new Point(442, 548);
+            var cancel = new Button { Text = firstRun ? "Quit" : "Cancel", DialogResult = DialogResult.Cancel, Width = 90, Location = new Point(538, 548) };
             AcceptButton = ok;
             CancelButton = cancel;
 
             understand.CheckedChanged += (s, e) => Check();
-            Controls.AddRange(new Control[] { notice, folderLabel, folder, browse, folderHint, understand, startWithWindows, bringDataBack, ok, cancel });
+            Controls.AddRange(new Control[] { notice, folderLabel, folder, browse, folderHint, understand, startWithWindows, bringDataBack, keepAddon, ok, cancel });
             Check();
         }
 
@@ -87,12 +90,13 @@ namespace Tallybook.Tray
         public void ApplyTo(TrayConfig config)
         {
             config.WowFolder = folder.Text;
-            config.AcceptedNotice = understand.Checked;
+            config.AcceptedNoticeVersion = understand.Checked ? Notice.VersionOf(NoticeText()) : 0;
             config.StartWithWindows = startWithWindows.Checked;
             config.BringDataBack = bringDataBack.Checked;
+            config.KeepAddonUpToDate = keepAddon.Checked;
         }
 
-        public static string Notice()
+        public static string NoticeText()
         {
             using (Stream? s = Assembly.GetExecutingAssembly().GetManifestResourceStream("risk-notice.txt"))
             {

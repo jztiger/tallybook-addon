@@ -56,7 +56,8 @@ namespace Tallybook.Tray
                     ConfigStore.Save(Paths.Config, config, protector);
                 }
 
-                if (!config.AcceptedNotice || !GameFolders.LooksLikeWow(config.WowFolder))
+                // A newer notice means the program does something they have not agreed to yet: ask again.
+                if (config.AcceptedNoticeVersion < Notice.VersionOf(SetupForm.NoticeText()) || !GameFolders.LooksLikeWow(config.WowFolder))
                 {
                     using (var setup = new SetupForm(config, true))
                     {
@@ -128,7 +129,7 @@ namespace Tallybook.Tray
             TrayConfig? config = File.Exists(configFile) ? ConfigStore.ImportDownload(File.ReadAllText(configFile, Encoding.UTF8)) : null;
             if (config == null) return Say(opts, 1, "that is not a tallybook.config.json");
             config.WowFolder = wow;
-            config.AcceptedNotice = true;
+            config.AcceptedNoticeVersion = Notice.VersionOf(SetupForm.NoticeText());
 
             string work = Path.Combine(Path.GetTempPath(), "tallybook-once-" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(work);
@@ -206,7 +207,10 @@ namespace Tallybook.Tray
                 foreach (TrayState s in new[] { TrayState.Ok, TrayState.Retrying, TrayState.NeedsAttention, TrayState.Paused }) if (Icons.For(s).Width <= 0) return false;
                 return true;
             });
-            Check("the risk notice is inside", () => SetupForm.Notice().Contains("THE RISK") && SetupForm.Notice().Contains("not made, approved or supported by Blizzard"));
+            Check("the risk notice is inside, and carries a version", () =>
+                SetupForm.NoticeText().Contains("THE RISK")
+                && SetupForm.NoticeText().Contains("not made, approved or supported by Blizzard")
+                && Notice.VersionOf(SetupForm.NoticeText()) > 0);
 
             lines.Add(ok ? "selftest ok" : "selftest FAILED");
             return Say(opts, ok ? 0 : 1, string.Join(Environment.NewLine, lines));

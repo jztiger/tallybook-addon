@@ -25,6 +25,8 @@ namespace Tallybook.Tray
         public int Uploaded { get; set; }
         public int Rejected { get; set; }
         public int Wrote { get; set; }
+        /// <summary>The addon version installed this pass, or null when nothing was installed.</summary>
+        public string? AddonInstalled { get; set; }
         public TrayState State { get; set; } = TrayState.Ok;
         /// <summary>Plain words for the tooltip when the state is not Ok.</summary>
         public string Reason { get; set; } = "";
@@ -38,6 +40,8 @@ namespace Tallybook.Tray
     public sealed class Cycle
     {
         public static readonly TimeSpan FetchEvery = TimeSpan.FromMinutes(30);
+        /// <summary>An addon version comes out rarely; the check is cheap but there is no point being eager.</summary>
+        public static readonly TimeSpan AddonEvery = TimeSpan.FromHours(6);
         /// <summary>The server's own cap on a saved file. A bigger one is not ours.</summary>
         private const long MaxSavedBytes = 64L * 1024 * 1024;
         private static readonly Regex PricesAt = new Regex(@"\bpricesAt = (\d{9,11}),", RegexOptions.CultureInvariant);
@@ -56,6 +60,9 @@ namespace Tallybook.Tray
         private bool refused;
         private string? etag;
         private byte[]? lastLua;
+        private string? addonEtag;
+        private DateTime? addonCheckedUtc;
+        private bool addonUnsure;
 
         public DateTime? LastUploadUtc { get; private set; }
         public DateTime? LastFetchUtc { get; private set; }
@@ -125,6 +132,18 @@ namespace Tallybook.Tray
                 }
             }
 
+            // Before the data file, so a fresh install's empty Data.lua is filled in this same pass.
+            if (config.KeepAddonUpToDate)
+            {
+                string? stop = await KeepAddonCurrent(report, now, force).ConfigureAwait(false);
+                if (stop != null)
+                {
+                    refused = true;
+                    log.Write("refused: " + stop + " - stopped until asked again");
+                    return Done(report, TrayState.NeedsAttention, "The server refused this PC's credentials");
+                }
+            }
+
             bool due = LastFetchUtc == null || now - LastFetchUtc.Value >= FetchEvery;
             if (config.BringDataBack && (report.Uploaded > 0 || force || due))
             {
@@ -152,6 +171,63 @@ namespace Tallybook.Tray
 
             backoff.Reset();
             return report;
+        }
+
+        /// <summary>
+        /// Installs the addon when it is missing and replaces it when a newer version is published. Returns null
+        /// normally, or the reason when the server refused this PC - anything else is logged and let go, because a
+        /// server with no addon to offer must not stop the uploads.
+        /// </summary>
+        private async Task<string?> KeepAddonCurrent(CycleReport report, DateTime now, bool force)
+        {
+            // Where it already is - those get replaced. Only when it is nowhere does a first install pick a folder,
+            // and then never on a guess: a Forever addon does not belong in somebody's retail game.
+            IReadOnlyList<string> folders = GameFolders.AddonFolders(config.WowFolder);
+            bool missing = folders.Count == 0;
+            if (missing)
+            {
+                string? fresh = GameFolders.InstallTarget(config.WowFolder);
+                if (fresh == null)
+                {
+                    if (!addonUnsure)
+                    {
+                        addonUnsure = true;
+                        log.Write("the addon is not installed and there is more than one game here - install it once yourself");
+                    }
+                    return null;
+                }
+                folders = new[] { fresh };
+            }
+            bool due = force || addonCheckedUtc == null || now - addonCheckedUtc.Value >= AddonEvery;
+            if (!missing && !due) return null;
+
+            // A missing addon has to be fetched whole, whatever our etag says about the last one we saw.
+            (FetchResult result, AddonManifest? manifest, string? tag) =
+                await client.FetchAddonAsync(missing ? null : addonEtag).ConfigureAwait(false);
+            addonCheckedUtc = now;
+            if (result == FetchResult.Refused) return client.LastError;
+            if (result == FetchResult.NotModified) return null;
+            if (result != FetchResult.Changed || manifest == null)
+            {
+                log.Write("no addon to install this time: " + client.LastError);
+                return null;
+            }
+            addonEtag = tag;
+
+            foreach (string folder in folders)
+            {
+                if (AddonInstaller.InstalledVersion(folder) == manifest.Version) continue;
+                try
+                {
+                    log.Write(AddonInstaller.Install(folder, manifest));
+                    report.AddonInstalled = manifest.Version;
+                }
+                catch (Exception e) when (e is IOException || e is UnauthorizedAccessException || e is InvalidOperationException)
+                {
+                    log.Write("could not install the addon: " + e.Message);
+                }
+            }
+            return null;
         }
 
         private IEnumerable<FileInfo> QuietSavedFiles(DateTime now)
