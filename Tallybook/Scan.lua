@@ -461,6 +461,7 @@ local function finishBrowse(run, complete, why)
         db.prices = Logic.priceTable(rows)
         db.listed = Logic.listedTable(rows)
         db.pricesAt = t1
+        db.pricesFrom = nil -- the player's own scan now: no "saved" / "shared" label
         ns.changed() -- the costs in an open profession window follow the new prices
     else
         ns.print("INCOMPLETE (" .. tostring(why) .. "): saved for the record, but the server will not use its prices")

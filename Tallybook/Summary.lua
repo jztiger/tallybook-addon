@@ -191,7 +191,8 @@ local function paint()
         end
     end
     if hasPrices then
-        panel.title:SetText(professionName() .. " - prices from " .. Logic.formatAge(ns.serverTime() - db.pricesAt) .. " ago")
+        panel.title:SetText(professionName() .. " - prices from " .. Logic.formatAge(ns.serverTime() - db.pricesAt) .. " ago"
+            .. ns.UI.priceSource(" (", ")"))
     else
         panel.title:SetText(professionName() .. " - no AH prices yet: /tally browse at the auction house")
     end

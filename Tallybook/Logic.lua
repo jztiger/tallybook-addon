@@ -9,7 +9,7 @@ ns = ns or {}
 local L = {}
 ns.Logic = L
 
-L.VERSION = "0.7.0"
+L.VERSION = "0.8.0"
 L.SCHEMA = 1
 L.REPLICATE_COOLDOWN = 900
 -- What the auction house keeps of a sale, in percent (5 at a faction auction house in every version of
@@ -23,6 +23,9 @@ L.MAX_ROWS = 250000
 -- The bake step does not decode a reference string longer than this (MAX_REF_BASE64_CHARS in
 -- src/shared/ref-doc.ts; a test holds the two together, tag included).
 L.REF_MAX_BYTES = 4 * 1024 * 1024
+-- Auction prices from the data file are not adopted when older than this (the bake and the server do not send
+-- older ones either: PRICES_MAX_AGE in src/tools/bake.ts).
+L.PRICES_MAX_AGE = 604800
 
 -- The server refuses any number that is not a safe integer (2^53 - 1).
 local MAX_SAFE = 9007199254740991
@@ -417,6 +420,8 @@ function L.initDB(db)
     if type(db.vendor) ~= "table" then db.vendor = {} end
     if type(db.listed) ~= "table" then db.listed = {} end
     if type(db.settings) ~= "table" then db.settings = {} end
+    -- where the prices came from when not from this session's own scan: the data file's "saved" or "shared"
+    if db.pricesFrom ~= "saved" and db.pricesFrom ~= "shared" then db.pricesFrom = nil end
     return db
 end
 
@@ -798,10 +803,39 @@ function L.refOf(text)
     return string.match(text, "^r1:([A-Za-z0-9+/=]+)$")
 end
 
--- Copies into db whatever the baked tables know and this session does not. -> vendor prices added, recipes added
-function L.applyBaked(db, baked)
+-- Whole numbers from one id -> value table, copied. -> the copy, how many
+local function cleanCounts(src, minValue)
+    local out, n = {}, 0
+    if type(src) ~= "table" then return out, n end
+    for id, value in pairs(src) do
+        if isCount(id, 1) and isCount(value, minValue) then
+            out[id] = value
+            n = n + 1
+        end
+    end
+    return out, n
+end
+
+-- Auction prices in the data file (F10): the owner's own last scan ("saved", local bake) or the newest scan
+-- anyone uploaded ("shared", the server). NEWEST WINS: they are adopted only when newer than what the session
+-- has - so the player's own /tally browse always takes over - and never when older than PRICES_MAX_AGE.
+-- now may be nil (no clock yet): the age is then not checked. -> how many prices were adopted
+local function adoptPrices(db, baked, now)
+    if not isCount(baked.pricesAt, 1) or baked.pricesAt <= db.pricesAt then return 0 end
+    if isCount(now, 1) and now - baked.pricesAt > L.PRICES_MAX_AGE then return 0 end
+    local prices, n = cleanCounts(baked.prices, 1)
+    if n == 0 then return 0 end
+    db.prices, db.pricesAt = prices, baked.pricesAt
+    db.listed = cleanCounts(baked.listed, 0)
+    db.pricesFrom = baked.pricesFrom == "saved" and "saved" or "shared"
+    return n
+end
+
+-- Copies into db whatever the baked tables know and this session does not.
+-- -> vendor prices added, recipes added, auction prices adopted
+function L.applyBaked(db, baked, now)
     local vendorAdded, recipesAdded = 0, 0
-    if type(db) ~= "table" or type(baked) ~= "table" then return vendorAdded, recipesAdded end
+    if type(db) ~= "table" or type(baked) ~= "table" then return vendorAdded, recipesAdded, 0 end
     db = L.initDB(db)
     if type(baked.vendor) == "table" then
         for itemID, price in pairs(baked.vendor) do
@@ -826,7 +860,7 @@ function L.applyBaked(db, baked)
             end
         end
     end
-    return vendorAdded, recipesAdded
+    return vendorAdded, recipesAdded, adoptPrices(db, baked, now)
 end
 
 ---------------------------------------------------------------------------------------------------

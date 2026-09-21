@@ -46,6 +46,15 @@ UI.money = money
 -- Tooltip line: "Tallybook: <min price> (<age>)"
 ---------------------------------------------------------------------------------------------------
 
+-- Where the prices came from when not from this session's own scan: "saved" (the player's own earlier scan, handed
+-- back by the local bake) or "shared" (the newest scan anyone uploaded, from the server). "" for the player's own.
+function UI.priceSource(before, after)
+    local db = TallybookDB
+    local from = type(db) == "table" and db.pricesFrom or nil
+    if from ~= "saved" and from ~= "shared" then return "" end
+    return (before or "") .. from .. (after or "")
+end
+
 -- -> the line for this item, or nil when there is no price for it
 function UI.priceLine(itemID)
     if ns.isSecret(itemID) or type(itemID) ~= "number" then return nil end
@@ -55,7 +64,7 @@ function UI.priceLine(itemID)
     if type(price) ~= "number" or price <= 0 then return nil end
     local line = LABEL .. money(price)
     if type(db.pricesAt) == "number" and db.pricesAt > 0 then
-        line = line .. " (" .. Logic.formatAge(ns.serverTime() - db.pricesAt) .. ")"
+        line = line .. " (" .. Logic.formatAge(ns.serverTime() - db.pricesAt) .. UI.priceSource(", ") .. ")"
     end
     return line
 end
@@ -204,7 +213,7 @@ function UI.status()
     local priced = 0
     for _ in pairs(db.prices) do priced = priced + 1 end
     if priced > 0 then
-        ns.print(string.format("tooltip prices: %.0f items, from %s", priced, age(db.pricesAt, now)))
+        ns.print(string.format("tooltip prices: %.0f items, from %s", priced, age(db.pricesAt, now)) .. UI.priceSource(" (", ")"))
     else
         ns.print("tooltip prices: none yet - /tally browse fills them")
     end
