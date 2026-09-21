@@ -1,0 +1,14 @@
+Before you install - please read this
+
+Tallybook is a private tool for our group of friends. It is not made, approved or supported by Blizzard.
+
+WHAT THE TRAY APP DOES
+It reads one file that the Tallybook addon saves - your auction house scans, and what the addon has learned about recipes and vendor prices. It sends that file to our group's server, and it writes one data file back into the Tallybook addon's own folder, so your game has prices without you scanning. That is all. It does not touch the game while it runs, it reads nothing else on your PC, and it never sends your account name, your character names or any password.
+
+THE RISK
+Blizzard's terms do not give permission for programs like this. Well-known tools - the TradeSkillMaster desktop app, for one - have worked the same way for years without Blizzard acting against the people who use them, so the realistic chance of trouble is very small. It is not zero. If Blizzard ever did act, it could affect your whole Battle.net account, not just this game.
+
+YOUR CHOICE
+You can use the addon on its own with no tray app, and upload your file by hand on the website - or not upload at all. With the tray app you can switch off "Bring data back", pause it or quit it whenever you like, and remove it by deleting it.
+
+It is free, and it stays free. Nobody may charge for it or pass it on. When the beta ends, delete it and the addon.

@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- The Windows shell: a tray icon on .NET Framework 4.8, which every Windows 10 and 11 already has, so the
+       download is tiny and there is nothing to install. Built on Linux too, thanks to the reference assemblies.
+       Glue only - everything that decides anything is in Tallybook.Tray.Core, where it is unit-tested.
+       ONE FILE: the core's sources are compiled straight into this exe (no DLL, no binding redirects), because
+       Windows Defender refuses any zip holding our program but passes the signed exe on its own (2026-09-21). The
+       core stays its own netstandard2.0 project for the tests; both builds compile the very same files. -->
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <OutputType>WinExe</OutputType>
+    <AssemblyName>Tallybook</AssemblyName>
+    <RootNamespace>Tallybook.Tray</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <Version>0.1.0</Version>
+    <Product>Tallybook</Product>
+    <Description>Sends the Tallybook addon's saved file to your group's server and brings the data file back. Reads and writes nothing else.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Security" />
+    <Reference Include="System.Net.Http" />
+    <Reference Include="System.Runtime.Serialization" />
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <Compile Include="../Tallybook.Tray.Core/**/*.cs" Exclude="../Tallybook.Tray.Core/bin/**;../Tallybook.Tray.Core/obj/**" LinkBase="Core" />
+    <!-- The same words the website shows before the download; one file, so they cannot drift. -->
+    <EmbeddedResource Include="../../shared/risk-notice.txt" LogicalName="risk-notice.txt" />
+  </ItemGroup>
+</Project>

@@ -31,9 +31,20 @@ Known limit of the current beta build: the game does not read addon saved data b
 `/tally browse` per session. `Data.lua` is where learned vendor prices and recipes are handed back as code; the copy here is
 empty.
 
+## The tray app (`tray/`)
+
+Optional. A small Windows program (C#, .NET Framework 4.8) for members of our group: it sends the addon's saved file to
+the group's private server and writes one shared `Data.lua` back into the addon's folder, so the game has prices without
+scanning. It reads `Tallybook.lua` / `Tallybook.lua.bak` under the World of Warcraft folder **you** pick, writes that one
+`Data.lua`, and touches nothing else: it does not look at the game while it runs, find or scan anything by itself, update
+itself, or run without its tray icon. `shared/risk-notice.txt` is what every member reads before downloading it. It is
+useless without a membership - the server is private - but the source is here so anyone can read what it does.
+Build: `dotnet build tray/Tallybook.Tray -c Release`; tests: `dotnet test tray/Tallybook.Tray.Tests`.
+
 ## About this repository
 
-This is the addon's code only, published so that anyone can read it, as Blizzard's UI Add-On Development Policy requires.
+This is the code of what our group is handed - the addon, and the optional tray app - published so that anyone can read
+it, as Blizzard's UI Add-On Development Policy requires of addons.
 It is developed elsewhere and mirrored here per release, which is why the history is one commit per version. Comments that
 mention design documents or rule numbers (C7, C11...) refer to notes kept with the development copy.
 
