@@ -9,7 +9,7 @@ ns = ns or {}
 local L = {}
 ns.Logic = L
 
-L.VERSION = "0.8.3"
+L.VERSION = "0.8.4"
 L.SCHEMA = 1
 L.REPLICATE_COOLDOWN = 900
 -- What the auction house keeps of a sale, in percent (5 at a faction auction house in every version of
