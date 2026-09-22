@@ -162,6 +162,8 @@ local function finishReplicate(run, agg, n, unreadable, noLink)
         rowCount = agg.rowCount,
         bidOnly = agg.bidOnly,
         noLink = noLink,
+        variant = "bonus",
+        suffixSeen = agg.suffixSeen,
     })
     ns.Export.save(doc)
 end
@@ -172,6 +174,7 @@ local function processReplicate(run, n)
     local getInfo = C_AuctionHouse.GetReplicateItemInfo
     local getLink = C_AuctionHouse.GetReplicateItemLink
     local secret = type(issecretvalue) == "function" and issecretvalue or nil
+    local parseVariant = Logic.parseVariant
     local parseSuffix = Logic.parseSuffix
     local i = 0          -- the replicate list is 0-indexed: rows 0 .. n-1
     local unreadable = 0 -- rows with no item id, or holding a secret value
@@ -214,7 +217,8 @@ local function processReplicate(run, n)
                     end
                     local itemLink = link(i)
                     if itemLink ~= nil then
-                        agg:add(itemID, parseSuffix(itemLink), count, buyout, true)
+                        if parseSuffix(itemLink) ~= 0 then agg.suffixSeen = agg.suffixSeen + 1 end
+                        agg:add(itemID, parseVariant(itemLink), count, buyout, true)
                     else
                         waiting[#waiting + 1] = { i, itemID, count, buyout }
                     end
@@ -236,7 +240,8 @@ local function processReplicate(run, n)
             local row = waiting[looked]
             local itemLink = link(row[1])
             if itemLink ~= nil then
-                agg:add(row[2], parseSuffix(itemLink), row[3], row[4], true)
+                if parseSuffix(itemLink) ~= 0 then agg.suffixSeen = agg.suffixSeen + 1 end
+                agg:add(row[2], parseVariant(itemLink), row[3], row[4], true)
             else
                 noLink = noLink + 1
             end
@@ -728,6 +733,8 @@ function Scan.selftest()
         rowCount = agg.rowCount,
         bidOnly = agg.bidOnly,
         noLink = agg.noLink,
+        variant = "bonus",
+        suffixSeen = agg.suffixSeen,
     })
     ns.Export.save(doc)
 end

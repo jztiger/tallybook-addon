@@ -9,7 +9,7 @@ ns = ns or {}
 local L = {}
 ns.Logic = L
 
-L.VERSION = "0.8.1"
+L.VERSION = "0.8.2"
 L.SCHEMA = 1
 L.REPLICATE_COOLDOWN = 900
 -- What the auction house keeps of a sale, in percent (5 at a faction auction house in every version of
@@ -62,6 +62,27 @@ function L.parseSuffix(link)
     local field = string.match(link, "item:%-?%d+:[^:|]*:[^:|]*:[^:|]*:[^:|]*:[^:|]*:%s*(%-?%d+)")
     if not field then return 0 end
     local n = tonumber(field)
+    if not isInt(n) or n == 0 then return 0 end
+    return n
+end
+
+-- "|Hitem:4561::::::::20:1485:::1:12728::|h" -> 12728. The variant this client actually records: the
+-- FIRST bonus id, which is field 14, guarded by numBonusIDs at field 13.
+--
+-- Field 7 (what parseSuffix reads) is empty on every row this client produces, so a full scan keyed on
+-- it lumped every variant of an item together - board card B6, settled in game 2026-09-21. The bonus id
+-- lives in a DIFFERENT id space from the browse key's itemSuffix, and the server holds the crosswalk;
+-- the addon never guesses. `numBonusIDs` of 0 means the next field is not a bonus id at all.
+-- Evidence: docs/research/2026-09-21-b6-item-variants.md.
+function L.parseVariant(link)
+    if type(link) ~= "string" then return 0 end
+    -- itemID, then 12 fields, then the count and the first id
+    local count, first = string.match(
+        link,
+        "item:%-?%d+:" .. string.rep("[^:|]*:", 11) .. "%s*(%d*):%s*(%-?%d+)")
+    if not count or count == "" then return 0 end
+    if (tonumber(count) or 0) < 1 then return 0 end
+    local n = tonumber(first)
     if not isInt(n) or n == 0 then return 0 end
     return n
 end
@@ -133,7 +154,8 @@ function L.newAggregator()
     return setmetatable({
         rowCount = 0, -- every row handed to add()
         bidOnly = 0,  -- rows with buyout 0: counted, not recorded
-        noLink = 0,   -- recorded rows whose item link was missing (suffix recorded as 0)
+        noLink = 0,   -- recorded rows whose item link was missing (variant recorded as 0)
+        suffixSeen = 0, -- rows whose link DID fill field 7: 0 on this client, and we want to know if it changes
         invalid = 0,  -- rows the server would refuse: counted, not recorded
         tree = {},    -- itemID -> suffixID -> count -> buyout -> row
         list = {},
@@ -288,6 +310,10 @@ function L.buildDoc(meta, kind, complete, t0, t1, rows, extra)
     if kind == "replicate" then
         doc.bidOnly = countOr0(extra.bidOnly)
         doc.noLink = countOr0(extra.noLink)
+        -- Which id space the rows' variant column is in. The server cannot tell by looking, and a bonus
+        -- id is NOT an itemSuffix - board card B6. "suffix" only for a build that fills link field 7.
+        doc.variant = extra.variant == "suffix" and "suffix" or "bonus"
+        doc.suffixSeen = countOr0(extra.suffixSeen)
     end
     return doc
 end
