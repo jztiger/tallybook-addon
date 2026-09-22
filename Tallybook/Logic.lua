@@ -9,11 +9,13 @@ ns = ns or {}
 local L = {}
 ns.Logic = L
 
-L.VERSION = "0.8.4"
+L.VERSION = "0.8.5"
 L.SCHEMA = 1
 L.REPLICATE_COOLDOWN = 900
--- What the auction house keeps of a sale, in percent (5 at a faction auction house in every version of
--- the game so far; unverified on Forever). One place to change it.
+-- What the auction house keeps of a sale, in percent. MEASURED at 5 on Forever, 2026-09-22: a sale of
+-- 2100 copper returned 2337 after a 105 copper cut (docs/research/2026-09-22-ah-cut-and-deposit.md).
+-- This is only the fallback: the server owns the number, per market, and sends it in the data file, so
+-- that the game and the dashboard can never quote different profits. See L.applyBaked.
 L.AH_CUT_PERCENT = 5
 L.RING_MAX_SCANS = 12
 L.RING_MAX_BYTES = 8 * 1024 * 1024
@@ -874,6 +876,12 @@ function L.applyBaked(db, baked, now)
     local vendorAdded, recipesAdded = 0, 0
     if type(db) ~= "table" or type(baked) ~= "table" then return vendorAdded, recipesAdded, 0 end
     db = L.initDB(db)
+    -- The server's cut for this market. A figure it cannot justify is ignored rather than adopted: a
+    -- wrong cut is worse than a stale one, because every profit on screen would quietly be wrong.
+    local cut = baked.ahCutPercent
+    if type(cut) == "number" and cut == cut and cut >= 0 and cut <= 100 then
+        L.AH_CUT_PERCENT = cut
+    end
     if type(baked.vendor) == "table" then
         for itemID, price in pairs(baked.vendor) do
             if isCount(itemID, 1) and isCount(price, 1) and db.vendor[itemID] == nil then
