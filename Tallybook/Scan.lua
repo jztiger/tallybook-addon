@@ -39,6 +39,14 @@ local late    -- a full scan whose list had not arrived after REPLICATE_TIMEOUT.
               -- anything, and sends nothing; it only says "a list that arrives now is still mine".
 
 local ladderNext -- defined with the price ladders further down; the throttle handler above them calls it
+-- Defined with the variant learning further down, but finishBrowse - above it - starts it. A Lua local
+-- must be in scope where it is USED, not merely where it is assigned.
+local learnFromBrowse
+
+-- A whole number that can be an id. Secret values and floats are neither.
+local function isCountLike(v)
+    return not ns.isSecret(v) and type(v) == "number" and v >= 1 and v % 1 == 0
+end
 
 function Scan.busy()
     return current ~= nil
@@ -473,6 +481,100 @@ local function finishBrowse(run, complete, why)
     end
     local doc = Logic.buildDoc(run.meta, "browse", complete, run.t0, t1, rows, { uid = run.uid, rowCount = #results })
     ns.Export.save(doc)
+    -- Only after the scan is safely saved, and only for keys this scan itself returned (B6).
+    learnFromBrowse(results)
+end
+
+---------------------------------------------------------------------------------------------------
+-- Learning variant pairs (board card B6)
+---------------------------------------------------------------------------------------------------
+-- A full scan reads an auction's variant from the item link, where this client keeps it as a BONUS id.
+-- A browse scan reads it from the item key, where it is an itemSuffix. They are different id spaces and
+-- nothing can compute one from the other, so the two numbers have to be seen together - which happens in
+-- exactly one place: an item search result, which carries both the key and the auction's link.
+--
+-- So the server names the suffixes it still has no pair for (ns.baked.wantVariants) and this looks a few
+-- of them up, but ONLY right after a browse scan the player asked for, only for keys that scan already
+-- returned, and never more than LEARN_MAX of them. The pairs go home in the reference document.
+
+local LEARN_MAX = 8
+local LEARN_TIMEOUT = 8
+
+local function learnNext(run)
+    if current ~= run or run.waiting then return end
+    if run.index >= #run.keys then
+        current = nil
+        if run.learned > 0 then
+            ns.print(string.format("learned %.0f item %s for the group", run.learned,
+                run.learned == 1 and "variant" or "variants"))
+        end
+        return
+    end
+    if not C_AuctionHouse.IsThrottledMessageSystemReady() then return end -- the ready event brings us back
+    run.index = run.index + 1
+    local key, index = run.keys[run.index], run.index
+    local sorts = {}
+    local order = type(Enum) == "table" and type(Enum.AuctionHouseSortOrder) == "table" and Enum.AuctionHouseSortOrder
+    if order and order.Price ~= nil then sorts[1] = { sortOrder = order.Price, reverseSort = false } end
+    if not pcall(C_AuctionHouse.SendSearchQuery, key, sorts, false) then return learnNext(run) end
+    run.waiting = key
+    -- A key with no live auction answers with nothing at all; every step carries its own deadline so one
+    -- silent answer cannot strand the rest (the same trap the probe's first sweep fell into).
+    ns.after(LEARN_TIMEOUT, function()
+        if current ~= run or run.index ~= index or run.waiting ~= key then return end
+        run.waiting = nil
+        learnNext(run)
+    end)
+end
+
+-- -> true when this search was ours, so the ladder never sees it.
+local function learnAnswer(itemKey)
+    local run = current
+    if not run or run.kind ~= "learn" then return false end
+    local waiting = run.waiting
+    if type(waiting) ~= "table" or waiting.itemID ~= itemKey.itemID
+        or waiting.itemSuffix ~= itemKey.itemSuffix then return false end
+    run.waiting = nil
+    local suffix = itemKey.itemSuffix
+    local n = C_AuctionHouse.GetNumItemSearchResults(itemKey)
+    if not ns.isSecret(n) and type(n) == "number" and n >= 1 and isCountLike(suffix) then
+        local r = C_AuctionHouse.GetItemSearchResultInfo(itemKey, 1)
+        if type(r) == "table" and not ns.isSecret(r.itemLink) then
+            local bonus = Logic.parseVariant(r.itemLink)
+            if bonus ~= 0 then
+                local db = ns.db()
+                if type(db.variants) ~= "table" then db.variants = {} end
+                if db.variants[bonus] == nil then run.learned = run.learned + 1 end
+                db.variants[bonus] = suffix
+            end
+        end
+    end
+    learnNext(run)
+    return true
+end
+
+-- Started only by finishBrowse, with the results of the scan the player just ran.
+function learnFromBrowse(results)
+    if current then return end -- never in the way of a scan
+    local baked = ns.baked
+    local want = type(baked) == "table" and baked.wantVariants or nil
+    if type(want) ~= "table" or #want == 0 then return end
+    local wanted = {}
+    for i = 1, #want do
+        if isCountLike(want[i]) then wanted[want[i]] = true end
+    end
+    local keys, seen = {}, {}
+    for i = 1, #results do
+        local k = type(results[i]) == "table" and results[i].itemKey
+        if type(k) == "table" and isCountLike(k.itemSuffix) and wanted[k.itemSuffix] and not seen[k.itemSuffix] then
+            seen[k.itemSuffix] = true
+            keys[#keys + 1] = k
+            if #keys >= LEARN_MAX then break end
+        end
+    end
+    if #keys == 0 then return end
+    current = { kind = "learn", keys = keys, index = 0, learned = 0 }
+    learnNext(current)
 end
 
 -- The first page: one query, sent once, and only when the client's throttle is ready.
@@ -556,6 +658,7 @@ ns.on("AUCTION_HOUSE_BROWSE_RESULTS_ADDED", onBrowseResults)
 
 ns.on("AUCTION_HOUSE_THROTTLED_SYSTEM_READY", function()
     local run = current
+    if run and run.kind == "learn" then return learnNext(run) end
     if run and run.kind == "ladder" then return ladderNext(run) end
     if not run or run.kind ~= "browse" then return end
     if not run.sent then
@@ -688,6 +791,7 @@ end)
 ns.on("ITEM_SEARCH_RESULTS_UPDATED", function(itemKey)
     if type(itemKey) ~= "table" or type(C_AuctionHouse.GetNumItemSearchResults) ~= "function"
         or type(C_AuctionHouse.GetItemSearchResultInfo) ~= "function" then return end
+    if learnAnswer(itemKey) then return end
     ladderAnswer(itemKey.itemID, C_AuctionHouse.GetNumItemSearchResults(itemKey), function(i)
         local r = C_AuctionHouse.GetItemSearchResultInfo(itemKey, i)
         if type(r) ~= "table" then return nil end

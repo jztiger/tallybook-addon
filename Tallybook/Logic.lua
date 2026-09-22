@@ -9,7 +9,7 @@ ns = ns or {}
 local L = {}
 ns.Logic = L
 
-L.VERSION = "0.8.2"
+L.VERSION = "0.8.3"
 L.SCHEMA = 1
 L.REPLICATE_COOLDOWN = 900
 -- What the auction house keeps of a sale, in percent (5 at a faction auction house in every version of
@@ -806,14 +806,25 @@ function L.refDoc(db, at)
             end
         end
     end
+    -- Variant pairs (board card B6): bonus id -> item suffix, learned from auctions this player looked at.
+    -- Both sides must be real ids; 0 means "no variant" on either side and pairs with nothing.
+    local variants = {}
+    if type(db.variants) == "table" then
+        local bonusIDs = sortedKeys(db.variants)
+        for i = 1, #bonusIDs do
+            local suffix = db.variants[bonusIDs[i]]
+            if isCount(suffix, 1) then variants[#variants + 1] = { bonusIDs[i], suffix } end
+        end
+    end
     local settings = cleanSettings(db.settings)
     local hasSettings = false
     for _ in pairs(settings) do
         hasSettings = true
         break
     end
-    if #vendor == 0 and #recipes == 0 and not hasSettings then return nil end
+    if #vendor == 0 and #recipes == 0 and #variants == 0 and not hasSettings then return nil end
     local doc = { schema = L.SCHEMA, kind = "ref", at = countOr0(at), addon = L.VERSION, vendor = vendor, recipes = recipes }
+    if #variants > 0 then doc.variants = variants end
     if hasSettings then doc.settings = settings end
     return doc
 end
