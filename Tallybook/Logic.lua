@@ -9,8 +9,13 @@ ns = ns or {}
 local L = {}
 ns.Logic = L
 
-L.VERSION = "0.8.5"
-L.SCHEMA = 1
+L.VERSION = "0.9.0"
+-- Two independent version counters, mirroring the server (src/shared/scan-schema.ts SCAN_SCHEMA_VERSION,
+-- src/shared/ref-doc.ts REF_SCHEMA_VERSION): the scan document's shape (replicate, browse) has not changed
+-- since M1, so buildDoc still tags SCAN_SCHEMA; the reference document gained items, suffixes and named
+-- recipes in M2, so refDoc tags SCHEMA.
+L.SCAN_SCHEMA = 1
+L.SCHEMA = 2
 L.REPLICATE_COOLDOWN = 900
 -- What the auction house keeps of a sale, in percent. MEASURED at 5 on Forever, 2026-09-22: a sale of
 -- 2100 copper returned 2337 after a 105 copper cut (docs/research/2026-09-22-ah-cut-and-deposit.md).
@@ -28,6 +33,11 @@ L.REF_MAX_BYTES = 4 * 1024 * 1024
 -- Auction prices from the data file are not adopted when older than this (the bake and the server do not send
 -- older ones either: PRICES_MAX_AGE in src/tools/bake.ts).
 L.PRICES_MAX_AGE = 604800
+-- M2: item names/quality and suffix names, learned this session (spec 2026-09-23). Mirrors MAX_ITEM_ROWS /
+-- MAX_SUFFIX_ROWS / MAX_NAME_CHARS in src/shared/ref-doc.ts.
+L.MAX_ITEM_ROWS = 20000
+L.MAX_SUFFIX_ROWS = 20000
+L.MAX_NAME_CHARS = 128
 
 -- The server refuses any number that is not a safe integer (2^53 - 1).
 local MAX_SAFE = 9007199254740991
@@ -51,6 +61,11 @@ end
 -- 16 lowercase hex characters
 local function isUid(v)
     return type(v) == "string" and #v == 16 and string.match(v, "^[0-9a-f]+$") ~= nil
+end
+
+-- A learned name (item, suffix, recipe or profession, M2): 1..MAX_NAME_CHARS bytes (UTF-8 is fine).
+local function validName(v)
+    return type(v) == "string" and #v >= 1 and #v <= L.MAX_NAME_CHARS
 end
 
 ---------------------------------------------------------------------------------------------------
@@ -143,6 +158,24 @@ function L.metaProblem(meta)
         return "the client did not report a build number"
     end
     return nil
+end
+
+-- The scan document is not re-learned when the newest known scan (own or pooled) is younger than this.
+L.AUTO_SCAN_MIN_AGE = 30 * 60
+
+-- The C7 limits (docs/decisions.md, revised 2026-09-23), as one decision: whether the ONE browse scan that
+-- may start itself on AUCTION_HOUSE_SHOW is allowed to this time. s = { enabled, ahOpen, scannedThisOpening,
+-- newestScanAt, now, cooldownRefused }. Order matters: the house being shut or the switch being off make
+-- every other field moot; a scan already run, or refused by the client's own cooldown, is never retried
+-- until the next opening; only then does freshness decide.
+-- -> "scan" | "skip-off" | "skip-fresh" | "skip-done" | "skip-cooldown" | "skip-closed"
+function L.autoScanDecision(s)
+    if type(s) ~= "table" or not s.ahOpen then return "skip-closed" end
+    if not s.enabled then return "skip-off" end
+    if s.scannedThisOpening then return "skip-done" end
+    if s.cooldownRefused then return "skip-cooldown" end
+    if countOr0(s.now) - countOr0(s.newestScanAt) < L.AUTO_SCAN_MIN_AGE then return "skip-fresh" end
+    return "scan"
 end
 
 ---------------------------------------------------------------------------------------------------
@@ -293,7 +326,7 @@ function L.buildDoc(meta, kind, complete, t0, t1, rows, extra)
     if not isUid(uid) then uid = L.newUid(t0, L.rand31()) end
 
     local doc = {
-        schema = L.SCHEMA,
+        schema = L.SCAN_SCHEMA,
         uid = uid,
         kind = kind,
         complete = complete and true or false,
@@ -448,6 +481,8 @@ function L.initDB(db)
     if type(db.vendor) ~= "table" then db.vendor = {} end
     if type(db.listed) ~= "table" then db.listed = {} end
     if type(db.settings) ~= "table" then db.settings = {} end
+    if type(db.items) ~= "table" then db.items = {} end
+    if type(db.suffixes) ~= "table" then db.suffixes = {} end
     -- where the prices came from when not from this session's own scan: the data file's "saved" or "shared"
     if db.pricesFrom ~= "saved" and db.pricesFrom ~= "shared" then db.pricesFrom = nil end
     return db
@@ -535,13 +570,15 @@ function L.cheapestRecipe(recipes, prices, vendor)
     return best.id, best.total, best.missing, best.each, best.recipe
 end
 
--- Files one recipe under its output item; seeing the same recipe again replaces it. -> true when stored.
-function L.addRecipe(book, outputItemID, recipeID, qty, mats)
+-- Files one recipe under its output item; seeing the same recipe again replaces it. name, professionName
+-- and skillLine (M2) are optional and ride along on the entry for refDoc to read; a recipe with none of
+-- them yet is still filed here for this session's own Crafting Cost. -> true when stored.
+function L.addRecipe(book, outputItemID, recipeID, qty, mats, name, professionName, skillLine)
     if type(book) ~= "table" or not isCount(outputItemID, 1) or not isCount(recipeID, 1) then return false end
     if not isCount(qty, 1) or not validMats(mats) then return false end
     local copy = {}
     for i = 1, #mats do copy[i] = { mats[i][1], mats[i][2] } end
-    local entry = { recipeID = recipeID, qty = qty, mats = copy }
+    local entry = { recipeID = recipeID, qty = qty, mats = copy, name = name, profession = professionName, skillLine = skillLine }
     local list = book[outputItemID]
     if type(list) ~= "table" then
         list = {}
@@ -554,6 +591,50 @@ function L.addRecipe(book, outputItemID, recipeID, qty, mats)
         end
     end
     list[#list + 1] = entry
+    return true
+end
+
+-- How many entries a table holds. Only used to enforce the item/suffix caps below: their keys (an itemID,
+-- or "itemID:suffixID") are not dense, so # is not reliable on them.
+local function tableSize(t)
+    local n = 0
+    for _ in pairs(t) do n = n + 1 end
+    return n
+end
+
+-- An item's name and quality (M2), learned once this session: the name never changes, so a later call for
+-- an id already known is a no-op rather than a rewrite. name is 1..MAX_NAME_CHARS bytes (UTF-8 is fine);
+-- quality an integer 0..7. -> true when recorded
+function L.noteItem(db, itemID, name, quality)
+    if type(db) ~= "table" or type(db.items) ~= "table" then return false end
+    if not isCount(itemID, 1) then return false end
+    if not validName(name) then return false end
+    if not isCount(quality, 0) or quality > 7 then return false end
+    if db.items[itemID] ~= nil then return false end
+    -- The cap check used to walk the whole table (tableSize) on every new id - free while few are known,
+    -- but a session that learns thousands would re-walk a growing table on each one. A running count,
+    -- lazily seeded from whatever db.items already holds the first time this runs (so a table filled some
+    -- other way, e.g. loaded state, still counts correctly), keeps every call after that O(1).
+    db.itemCount = db.itemCount or tableSize(db.items)
+    if db.itemCount >= L.MAX_ITEM_ROWS then return false end
+    db.items[itemID] = { name, quality }
+    db.itemCount = db.itemCount + 1
+    return true
+end
+
+-- The full name of one random-suffix item (M2), e.g. "Hunting Gloves of the Bear", keyed by item AND
+-- suffix: the same suffix reads differently on different base items. suffixID may be negative but never 0
+-- (that means no suffix, and needs no name). -> true when recorded
+function L.noteSuffix(db, itemID, suffixID, fullName)
+    if type(db) ~= "table" or type(db.suffixes) ~= "table" then return false end
+    if not isCount(itemID, 1) or not isInt(suffixID) or suffixID == 0 then return false end
+    if not validName(fullName) then return false end
+    local key = itemID .. ":" .. suffixID
+    if db.suffixes[key] ~= nil then return false end
+    db.suffixCount = db.suffixCount or tableSize(db.suffixes) -- see L.noteItem
+    if db.suffixCount >= L.MAX_SUFFIX_ROWS then return false end
+    db.suffixes[key] = { itemID, suffixID, fullName }
+    db.suffixCount = db.suffixCount + 1
     return true
 end
 
@@ -755,7 +836,7 @@ local function cleanSettings(src)
     if type(src) ~= "table" then return out end
     if LIST_MODES[src.list] then out.list = src.list end
     if SORT_KEYS[src.sortKey] then out.sortKey = src.sortKey end
-    for _, flag in ipairs({ "sortDesc", "knownOnly", "hideUnknown" }) do
+    for _, flag in ipairs({ "sortDesc", "knownOnly", "hideUnknown", "autoScan" }) do
         if type(src[flag]) == "boolean" then out[flag] = src[flag] end
     end
     if validPanel(src.panel) then
@@ -766,7 +847,8 @@ local function cleanSettings(src)
 end
 
 function L.settings(saved, baked)
-    local out = { list = "profit", sortKey = "profit", sortDesc = true, knownOnly = true, hideUnknown = false }
+    local out = { list = "profit", sortKey = "profit", sortDesc = true, knownOnly = true, hideUnknown = false,
+        autoScan = true }
     for _, layer in ipairs({ cleanSettings(baked), cleanSettings(saved) }) do
         for key, value in pairs(layer) do out[key] = value end
     end
@@ -783,8 +865,14 @@ local function sortedKeys(tbl)
 end
 
 -- -> { schema, kind = "ref", at, addon, vendor = { {itemID, price}, ... }, recipes = { {outputItemID,
--- recipeID, qty, { {itemID, qty}, ... }}, ... } }, both sorted; nil when there is nothing to tell.
--- Arrays throughout: JSON has no numeric keys. src/shared/ref-doc.ts is the contract.
+-- recipeID, qty, { {itemID, qty}, ... }, name, profession, skillLine}, ... }, items = { {itemID, name,
+-- quality}, ... }, suffixes = { {itemID, suffixID, name}, ... } }, all sorted; nil when there is nothing
+-- to tell. Arrays throughout: JSON has no numeric keys. src/shared/ref-doc.ts is the contract.
+--
+-- A recipe rides along only once it has a name and a profession (M2, C16 decision 1): one learned before
+-- names existed stays in db.recipes for this session's own Crafting Cost, but is left out here rather than
+-- sent as a v1-shaped row - it is relearned, with its name, the next time its profession window opens,
+-- which is the same moment it would have been sent anyway.
 function L.refDoc(db, at)
     if type(db) ~= "table" then return nil end
     local vendor, recipes = {}, {}
@@ -802,9 +890,12 @@ function L.refDoc(db, at)
             local recipeIDs = sortedKeys(byRecipe)
             for j = 1, #recipeIDs do
                 local entry = byRecipe[recipeIDs[j]]
-                local mats = {}
-                for m = 1, #entry.mats do mats[m] = { entry.mats[m][1], entry.mats[m][2] } end
-                recipes[#recipes + 1] = { outputs[i], entry.recipeID, isCount(entry.qty, 1) and entry.qty or 1, mats }
+                if validName(entry.name) and validName(entry.profession) then
+                    local mats = {}
+                    for m = 1, #entry.mats do mats[m] = { entry.mats[m][1], entry.mats[m][2] } end
+                    recipes[#recipes + 1] = { outputs[i], entry.recipeID, isCount(entry.qty, 1) and entry.qty or 1,
+                        mats, entry.name, entry.profession, isCount(entry.skillLine, 0) and entry.skillLine or 0 }
+                end
             end
         end
     end
@@ -818,28 +909,59 @@ function L.refDoc(db, at)
             if isCount(suffix, 1) then variants[#variants + 1] = { bonusIDs[i], suffix } end
         end
     end
+    -- Item names and quality (M2), keyed by itemID like vendor prices.
+    local items = {}
+    if type(db.items) == "table" then
+        local ids = sortedKeys(db.items)
+        for i = 1, #ids do
+            local it = db.items[ids[i]]
+            if type(it) == "table" and validName(it[1]) and isCount(it[2], 0) and it[2] <= 7 then
+                items[#items + 1] = { ids[i], it[1], it[2] }
+            end
+        end
+    end
+    -- Suffix full names (M2), stored under a composite "itemID:suffixID" key; sorted by the (itemID,
+    -- suffixID) the row itself carries rather than that string, so item 10's suffixes do not sort before
+    -- item 2's.
+    local suffixes = {}
+    if type(db.suffixes) == "table" then
+        for _, s in pairs(db.suffixes) do
+            if type(s) == "table" and isCount(s[1], 1) and isInt(s[2]) and s[2] ~= 0 and validName(s[3]) then
+                suffixes[#suffixes + 1] = { s[1], s[2], s[3] }
+            end
+        end
+        table.sort(suffixes, function(a, b)
+            if a[1] ~= b[1] then return a[1] < b[1] end
+            return a[2] < b[2]
+        end)
+    end
     local settings = cleanSettings(db.settings)
     local hasSettings = false
     for _ in pairs(settings) do
         hasSettings = true
         break
     end
-    if #vendor == 0 and #recipes == 0 and #variants == 0 and not hasSettings then return nil end
+    if #vendor == 0 and #recipes == 0 and #variants == 0 and #items == 0 and #suffixes == 0 and not hasSettings then
+        return nil
+    end
     local doc = { schema = L.SCHEMA, kind = "ref", at = countOr0(at), addon = L.VERSION, vendor = vendor, recipes = recipes }
     if #variants > 0 then doc.variants = variants end
     if hasSettings then doc.settings = settings end
+    if #items > 0 then doc.items = items end
+    if #suffixes > 0 then doc.suffixes = suffixes end
     return doc
 end
 
--- -> "r1:<b64>"   (its own tag: the scan extractor on the server only ever looks for "j1:" and "end:")
+-- -> "r2:<b64>"   (its own tag: the scan extractor on the server only ever looks for "j1:" and "end:")
 function L.refTag(b64)
-    return "r1:" .. tostring(b64)
+    return "r2:" .. tostring(b64)
 end
 
--- "r1:<b64>" -> b64 ; anything else -> nil
+-- "r2:<b64>" -> b64 ; anything else -> nil. This client only ever writes r2 now (the server still reads an
+-- r1 from an addon that has not updated, but Export.saveRef only ever checks its OWN tag right back).
 function L.refOf(text)
     if type(text) ~= "string" then return nil end
-    return string.match(text, "^r1:([A-Za-z0-9+/=]+)$")
+    return string.match(text, "^r2:([A-Za-z0-9+/=]+)$")
 end
 
 -- Whole numbers from one id -> value table, copied. -> the copy, how many
@@ -896,8 +1018,12 @@ function L.applyBaked(db, baked, now)
             if type(list) == "table" then
                 for i = 1, #list do
                     local entry = list[i]
+                    -- name / profession / skillLine ride along when the baked entry has them (it will not
+                    -- today: the bake step does not carry a recipe row past its first 4 fields), so this
+                    -- reads whatever a future bake step hands back rather than silently dropping it.
                     if type(entry) == "table" and known[entry.recipeID] == nil
-                        and L.addRecipe(db.recipes, outputItemID, entry.recipeID, entry.qty, entry.mats) then
+                        and L.addRecipe(db.recipes, outputItemID, entry.recipeID, entry.qty, entry.mats,
+                            entry.name, entry.profession, entry.skillLine) then
                         known[entry.recipeID] = true
                         recipesAdded = recipesAdded + 1
                     end

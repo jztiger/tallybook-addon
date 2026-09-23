@@ -266,7 +266,8 @@ SlashCmdList["TALLYBOOK"] = function(msg)
     reported = {}
     local command = commands[word]
     if not command then
-        ns.print("commands: /tally (status) | /tally scan | /tally browse | /tally profit | /tally basket | /tally list | /tally selftest | /tally reload")
+        ns.print("open the auction house - it scans; buttons for Scan / Browse / Stop are on the frame.")
+        ns.print("commands: /tally (status) | scan | browse | profit | basket | list | selftest | reload")
         return
     end
     local ok, err = pcall(command, arg, msg)

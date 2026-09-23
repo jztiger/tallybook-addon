@@ -23,7 +23,9 @@ local function basicType()
     return BASIC
 end
 
--- One recipe schematic -> outputItemID, quantity made, { {itemID, qty}, ... }  (nil when it is unusable)
+-- One recipe schematic -> outputItemID, quantity made, { {itemID, qty}, ... }, name (M2; the first three
+-- nil when the schematic is unusable, name nil when the schematic simply has none - a missing name is
+-- left missing, never guessed).
 local function readSchematic(schematic)
     if ns.isSecret(schematic) or type(schematic) ~= "table" then return nil end
     local slots = schematic.reagentSlotSchematics
@@ -40,7 +42,9 @@ local function readSchematic(schematic)
     end
     local made = schematic.quantityMin
     if ns.isSecret(made) or type(made) ~= "number" or made < 1 then made = 1 end
-    return schematic.outputItemID, made, mats
+    local name = schematic.name
+    if ns.isSecret(name) or type(name) ~= "string" or name == "" then name = nil end
+    return schematic.outputItemID, made, mats, name
 end
 
 local function countNew(book, outputItemID, recipeID)
@@ -50,6 +54,22 @@ local function countNew(book, outputItemID, recipeID)
         if type(list[i]) == "table" and list[i].recipeID == recipeID then return 0 end
     end
     return 1
+end
+
+-- The open profession's name and its numeric skill line (M2): C_TradeSkillUI.GetBaseProfessionInfo() is
+-- already used the same way in Summary.lua:80. professionID is the TradeSkillLineID (Tailoring = 197,
+-- what recipe.skill_line means server-side) - a different number from the small `profession` enum field
+-- on the same table, which this does not read. Guarded like every other client API here; 0 means unknown.
+local function professionInfo()
+    local T = C_TradeSkillUI
+    if type(T) ~= "table" or type(T.GetBaseProfessionInfo) ~= "function" then return nil, 0 end
+    local ok, info = pcall(T.GetBaseProfessionInfo)
+    if not ok or ns.isSecret(info) or type(info) ~= "table" then return nil, 0 end
+    local name = info.professionName
+    if ns.isSecret(name) or type(name) ~= "string" or name == "" then name = nil end
+    local id = info.professionID
+    if ns.isSecret(id) or type(id) ~= "number" or id < 0 or id % 1 ~= 0 then id = 0 end
+    return name, id
 end
 
 -- Reads every recipe of the open profession, SLICE per frame.
@@ -65,6 +85,7 @@ function Craft.learnRecipes()
     if not okIDs or type(ids) ~= "table" or #ids == 0 then return end
 
     local db = Logic.initDB(TallybookDB)
+    local profName, skillLine = professionInfo() -- once per run, not per recipe
     local i, added = 0, 0
     reading = true
     local function step()
@@ -74,10 +95,12 @@ function Craft.learnRecipes()
             local recipeID = ids[i]
             local ok, schematic = pcall(T.GetRecipeSchematic, recipeID, false)
             if ok then
-                local outputItemID, made, mats = readSchematic(schematic)
+                local outputItemID, made, mats, name = readSchematic(schematic)
                 if outputItemID then
                     local fresh = countNew(db.recipes, outputItemID, recipeID)
-                    if Logic.addRecipe(db.recipes, outputItemID, recipeID, made, mats) then added = added + fresh end
+                    if Logic.addRecipe(db.recipes, outputItemID, recipeID, made, mats, name, profName, skillLine) then
+                        added = added + fresh
+                    end
                 end
             end
         end
@@ -90,6 +113,9 @@ function Craft.learnRecipes()
         if added > 0 then
             ns.print(string.format("learned %.0f recipes (%.0f new) - hover a craftable item to see its Crafting Cost", #ids, added))
         end
+        -- M2: a small on-screen confirmation beside the Profit button, every run - not only when
+        -- something is new, so reopening an already-known profession still confirms it worked.
+        if ns.Summary and type(ns.Summary.setLearned) == "function" then ns.Summary.setLearned(#ids, added) end
     end
     local ok, err = pcall(step)
     if not ok then

@@ -434,19 +434,45 @@ function Summary.toggle()
     Summary.refresh()
 end
 
--- The "Profit" button, once, as soon as the game has built its profession window.
+-- The "Profit" button, once, as soon as the game has built its profession window. Safe to call again on
+-- a later event: the button and the label under it are each built at most once, but independently - if
+-- the label's pcall failed while the button's own succeeded, a later call tries the label again rather
+-- than leaving it missing for the rest of the session.
 function Summary.attach()
-    if Summary.button or cannotBuild or not window() then return end
-    local ok, button = pcall(CreateFrame, "Button", nil, window(), "UIPanelButtonTemplate")
-    if not ok then
-        ok, button = pcall(textButton, window(), 60, "CENTER", function() end)
-        if not ok then return end
+    if cannotBuild or not window() then return end
+    if not Summary.button then
+        local ok, button = pcall(CreateFrame, "Button", nil, window(), "UIPanelButtonTemplate")
+        if not ok then
+            ok, button = pcall(textButton, window(), 60, "CENTER", function() end)
+            if not ok then return end
+        end
+        button:SetSize(60, 22)
+        button:SetPoint("TOPLEFT", window(), "TOPRIGHT", 2, -28)
+        setText(button, "Profit")
+        button:SetScript("OnClick", guarded(function() Summary.toggle() end))
+        Summary.button = button
     end
-    button:SetSize(60, 22)
-    button:SetPoint("TOPLEFT", window(), "TOPRIGHT", 2, -28)
-    setText(button, "Profit")
-    button:SetScript("OnClick", guarded(function() Summary.toggle() end))
-    Summary.button = button
+
+    -- M2: "✓ learned 41 recipes, 3 new" (Craft.setLearned below). A child of the button itself, built the
+    -- same way and under the same guard, rather than of window() directly - a client that can build the
+    -- button can always build this too, and it needs nothing more from the game's own frame.
+    if not Summary.learnedText then
+        local okLabel, label = pcall(newLabel, Summary.button, "GameFontHighlightSmall", "LEFT")
+        if okLabel then
+            label:SetPoint("TOPLEFT", Summary.button, "BOTTOMLEFT", 0, -4)
+            label:SetWidth(200)
+            Summary.learnedText = label
+        end
+    end
+end
+
+-- Craft.learnRecipes calls this once per profession window read, whether or not it is the first
+-- (Summary.attach may not have run yet - Craft.lua loads first in the .toc - so this builds the label
+-- itself if needed; both are idempotent). A no-op on a client that could not build it either way.
+function Summary.setLearned(total, added)
+    Summary.attach()
+    if not Summary.learnedText then return end
+    Summary.learnedText:SetText(string.format("✓ learned %.0f recipes, %.0f new", total, added))
 end
 
 ns.onChange(Summary.refresh)

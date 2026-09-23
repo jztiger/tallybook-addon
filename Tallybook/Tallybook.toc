@@ -2,7 +2,7 @@
 ## Title: Tallybook
 ## Notes: Auction house price notebook. Read-only: never posts, bids, buys or cancels. Scans only when you ask.
 ## Author: jztiger
-## Version: 0.8.5
+## Version: 0.9.0
 ## SavedVariables: TallybookDB
 
 Logic.lua
@@ -10,6 +10,7 @@ Data.lua
 Core.lua
 Export.lua
 Scan.lua
+Strip.lua
 Craft.lua
 UI.lua
 List.lua

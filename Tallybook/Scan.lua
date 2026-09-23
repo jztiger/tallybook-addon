@@ -2,9 +2,12 @@
 -- reads them; it never changes anything there.
 --
 -- Rules this file keeps (docs/decisions.md C5-C7, C11):
---   * A scan starts only from Scan.replicate / Scan.browse / Scan.selftest, which only the typed
---     /tally commands call. Event handlers and timers below do nothing unless such a scan is
---     running, and then they only carry that one scan forward. Nothing re-arms itself.
+--   * A scan starts only from Scan.replicate / Scan.browse / Scan.selftest, which are called by the
+--     typed /tally commands and by the auction house strip's own buttons - and, for the browse scan
+--     alone, once per opening of the auction house (C7 as revised 2026-09-23: the six limits on that
+--     one are all in Strip.lua; nothing in this file decides it). Event handlers and timers below do
+--     nothing unless such a scan is running, and then they only carry that one scan forward. Nothing
+--     re-arms itself.
 --   * Player names are never read: the four name positions of a replicate row are discarded in
 --     the assignment itself, and only itemKey / minPrice / totalQuantity of a browse row are read.
 --   * One request per player action for the full scan, with a self-imposed cooldown; browse pages
@@ -38,6 +41,11 @@ local current -- the running scan, or nil. A new table per scan, so stale timers
 local late    -- a full scan whose list had not arrived after REPLICATE_TIMEOUT. It no longer blocks
               -- anything, and sends nothing; it only says "a list that arrives now is still mine".
 
+-- When this session's newest scan of the market finished, as server time, or 0. Set in the two places a
+-- scan document is saved and nowhere else: a synthetic /tally selftest is no scan of a market and must
+-- never hold the next real one off. The strip reads it through Scan.status (C7's 30-minute limit).
+local lastScanAt = 0
+
 local ladderNext -- defined with the price ladders further down; the throttle handler above them calls it
 -- Defined with the variant learning further down, but finishBrowse - above it - starts it. A Lua local
 -- must be in scope where it is USED, not merely where it is assigned.
@@ -48,8 +56,38 @@ local function isCountLike(v)
     return not ns.isSecret(v) and type(v) == "number" and v >= 1 and v % 1 == 0
 end
 
+-- A whole number of either sign, not secret (itemKey.itemSuffix may legitimately be 0, unlike an id).
+local function isIntLike(v)
+    return not ns.isSecret(v) and type(v) == "number" and v % 1 == 0
+end
+
 function Scan.busy()
     return current ~= nil
+end
+
+-- What the auction house strip shows (Strip.lua). Read-only, and busy is only ever about a scan of the
+-- market: the short learn and ladder runs are nothing the Stop button should offer to end.
+-- -> { busy, kind, pages, lastScanAt }
+function Scan.status()
+    local run = current
+    local scanning = run ~= nil and (run.kind == "replicate" or run.kind == "browse")
+    return {
+        busy = scanning,
+        kind = scanning and run.kind or nil,
+        pages = scanning and run.pages or nil,
+        lastScanAt = lastScanAt,
+    }
+end
+
+-- Whether the client would take a query this instant. Its own throttle is what refuses one: a scan the
+-- player asked for waits for it (browseSend below), and the strip - which nobody clicked - does not, so
+-- that no query of its making can ever leave on a later event (C7 limits 1 and 6).
+function Scan.throttleReady()
+    if type(C_AuctionHouse) ~= "table" or type(C_AuctionHouse.IsThrottledMessageSystemReady) ~= "function" then
+        return false
+    end
+    local ok, ready = pcall(C_AuctionHouse.IsThrottledMessageSystemReady)
+    return ok and ready == true
 end
 
 -- Called by Core after any error: never stay busy.
@@ -108,6 +146,45 @@ local function ready(api, events)
 end
 
 ---------------------------------------------------------------------------------------------------
+-- Item names, quality and suffix names (M2, spec 2026-09-23): a side effect of both scans below, never a
+-- request of their own. A row/result with no variant carries its own base name already; one WITH a variant
+-- (a different id space on each side - board card B6) needs the item template's own unsuffixed name
+-- instead. Logic.noteItem / noteSuffix are no-ops for an id already known, so calling either every scan
+-- costs nothing once a name is learned.
+---------------------------------------------------------------------------------------------------
+
+-- The item template's own name, no suffix: C_Item.GetItemInfo where it exists, else the classic global
+-- GetItemInfo (Ruling B). Guarded both ways - a client with neither simply learns no base name for a
+-- variant row; a name the client has not cached yet is left missing, never guessed (spec section 3).
+local function templateName(itemID)
+    local ok, name
+    if type(C_Item) == "table" and type(C_Item.GetItemInfo) == "function" then
+        ok, name = pcall(C_Item.GetItemInfo, itemID)
+    elseif type(GetItemInfo) == "function" then
+        ok, name = pcall(GetItemInfo, itemID)
+    else
+        return nil
+    end
+    if ok and not ns.isSecret(name) and type(name) == "string" and name ~= "" then return name end
+    return nil
+end
+
+-- Wraps a one-argument lookup so it is asked at most once per distinct key: a table made fresh for one
+-- scan run, never shared between runs or between the replicate and browse paths.
+local function memoize(fn)
+    local cache = {}
+    return function(key)
+        local hit = cache[key]
+        if hit == nil then
+            hit = fn(key) or false -- false marks "looked up, nothing there" so it is not asked again
+            cache[key] = hit
+        end
+        if hit == false then return nil end
+        return hit
+    end
+end
+
+---------------------------------------------------------------------------------------------------
 -- /tally scan : the full-market replicate scan
 ---------------------------------------------------------------------------------------------------
 
@@ -159,13 +236,16 @@ local function finishReplicate(run, agg, n, unreadable, noLink)
     if not complete then
         local why = "the list kept changing"
         if not run.readOk then
-            why = "the auction house was closed"
+            -- Cut short mid-read: by whatever ended it (interrupt records that), or by the house being
+            -- shut without one - which only leaves ns.ahOpen false, and is the case the fallback names.
+            why = run.stoppedWhy or "the auction house was closed"
         elseif dropped > 0 then
             why = string.format("%.0f of %.0f rows could not be read", dropped, n)
         end
         ns.print("INCOMPLETE (" .. why .. "): saved for the record, but the server will not use its prices")
     end
-    local doc = Logic.buildDoc(run.meta, "replicate", complete, run.t0, ns.serverTime(), rows, {
+    local t1 = ns.serverTime()
+    local doc = Logic.buildDoc(run.meta, "replicate", complete, run.t0, t1, rows, {
         uid = run.uid,
         rowCount = agg.rowCount,
         bidOnly = agg.bidOnly,
@@ -174,23 +254,26 @@ local function finishReplicate(run, agg, n, unreadable, noLink)
         suffixSeen = agg.suffixSeen,
     })
     ns.Export.save(doc)
+    lastScanAt = t1 -- the market was read, complete or not: the strip counts it as this session's newest
 end
 
 local function processReplicate(run, n)
     run.processing = true
     local agg = Logic.newAggregator()
+    local db = ns.db()
     local getInfo = C_AuctionHouse.GetReplicateItemInfo
     local getLink = C_AuctionHouse.GetReplicateItemLink
     local secret = type(issecretvalue) == "function" and issecretvalue or nil
     local parseVariant = Logic.parseVariant
     local parseSuffix = Logic.parseSuffix
+    local baseName = memoize(templateName) -- M2: one GetItemInfo per distinct itemID, this run only
     local i = 0          -- the replicate list is 0-indexed: rows 0 .. n-1
     local unreadable = 0 -- rows with no item id, or holding a secret value
     -- The suffix id comes from the item link, and a link can be missing while the client is still
     -- loading the item. Such a row is NOT filed under suffix 0 (that would record its price under
     -- an item key that does not exist and leave the real one looking sold out): it waits here for
     -- one more look, and if it still has no link it is left out and the scan is incomplete.
-    local waiting = {}   -- { index, itemID, count, buyout }
+    local waiting = {}   -- { index, itemID, count, buyout, name, qualityID, hasAllInfo }
     local looked = 0     -- how many of `waiting` have had their second look
     local noLink = 0
     local marks = { [0] = true, [math.floor(n / 2)] = true, [n - 1] = true } -- rows that go into the signature
@@ -200,6 +283,22 @@ local function processReplicate(run, n)
         local value = getLink(index)
         if value ~= nil and secret and secret(value) then return nil end
         return value
+    end
+
+    -- M2 (Ruling B): called only once a row's variant is known, from both loops below. No variant -> the
+    -- row's own name IS the base name, when hasAllInfo said the row was whole. A variant -> the row's name
+    -- is the FULL suffixed name (Ruling A: never sent to noteSuffix - a full scan never calls it at all,
+    -- since field 7 is empty on this client, board card B6) - so the base name is asked for separately.
+    local function noteRow(itemID, variant, name, qualityID, hasAllInfo)
+        if secret and secret(qualityID) then return end
+        if variant == 0 then
+            if not (secret and secret(hasAllInfo)) and hasAllInfo == true and not (secret and secret(name)) then
+                Logic.noteItem(db, itemID, name, qualityID)
+            end
+        else
+            local base = baseName(itemID)
+            if base then Logic.noteItem(db, itemID, base, qualityID) end
+        end
     end
 
     local function step()
@@ -214,7 +313,7 @@ local function processReplicate(run, n)
         if i < n then
             while i < n and budget > 0 do
                 -- Positions 12-15 are player names: they are discarded right here and never held.
-                local _, _, count, _, _, _, _, _, _, buyout, _, _, _, _, _, _, itemID = getInfo(i)
+                local name, _, count, qualityID, _, _, _, _, _, buyout, _, _, _, _, _, _, itemID, hasAllInfo = getInfo(i)
                 if secret and (secret(itemID) or secret(count) or secret(buyout)) then
                     unreadable = unreadable + 1
                 elseif not itemID or itemID == 0 then
@@ -226,9 +325,11 @@ local function processReplicate(run, n)
                     local itemLink = link(i)
                     if itemLink ~= nil then
                         if parseSuffix(itemLink) ~= 0 then agg.suffixSeen = agg.suffixSeen + 1 end
-                        agg:add(itemID, parseVariant(itemLink), count, buyout, true)
+                        local variant = parseVariant(itemLink)
+                        agg:add(itemID, variant, count, buyout, true)
+                        noteRow(itemID, variant, name, qualityID, hasAllInfo)
                     else
-                        waiting[#waiting + 1] = { i, itemID, count, buyout }
+                        waiting[#waiting + 1] = { i, itemID, count, buyout, name, qualityID, hasAllInfo }
                     end
                 end
                 i = i + 1
@@ -249,7 +350,9 @@ local function processReplicate(run, n)
             local itemLink = link(row[1])
             if itemLink ~= nil then
                 if parseSuffix(itemLink) ~= 0 then agg.suffixSeen = agg.suffixSeen + 1 end
-                agg:add(row[2], parseVariant(itemLink), row[3], row[4], true)
+                local variant = parseVariant(itemLink)
+                agg:add(row[2], variant, row[3], row[4], true)
+                noteRow(row[2], variant, row[5], row[6], row[7])
             else
                 noLink = noLink + 1
             end
@@ -446,6 +549,48 @@ local function browseResults()
     return results
 end
 
+-- True when a browse result's key has nothing left for GetItemKeyInfo to teach: itemSuffix 0 needs only
+-- the base item's own name (db.items); a non-zero itemSuffix needs that AND its own full suffixed name
+-- (db.suffixes, keyed exactly as Logic.noteSuffix keys it - read here, not assumed). A whole-market browse
+-- returns the same keys session after session, so this turns most of a repeat scan's names into no call
+-- at all rather than a pcall that would only confirm what is already known.
+local function namesKnown(db, key)
+    if type(db.items) ~= "table" or db.items[key.itemID] == nil then return false end
+    if key.itemSuffix == 0 then return true end
+    return type(db.suffixes) == "table" and db.suffixes[key.itemID .. ":" .. key.itemSuffix] ~= nil
+end
+
+-- M2 (Ruling A/B): for each result's itemKey, GetItemKeyInfo answers itemName and quality once the client
+-- has cached the key - or nil until ITEM_KEY_ITEM_INFO_RECEIVED, in which case this result is skipped and
+-- a later scan sees it (no new event handler for this). itemSuffix 0 IS the base item: straight to
+-- noteItem. A non-zero itemSuffix is the FULL suffixed name, to noteSuffix; its base name is a separate,
+-- memoized lookup (the item template), because a suffixed key's own itemName is never the unsuffixed one.
+local function noteBrowseNames(results)
+    local getKeyInfo = C_AuctionHouse.GetItemKeyInfo
+    if type(getKeyInfo) ~= "function" then return end
+    local db = ns.db()
+    local baseName = memoize(templateName)
+    for i = 1, #results do
+        local key = results[i].itemKey
+        if type(key) == "table" and isCountLike(key.itemID) and isIntLike(key.itemSuffix)
+            and not namesKnown(db, key) then
+            local ok, info = pcall(getKeyInfo, key)
+            if ok and not ns.isSecret(info) and type(info) == "table"
+                and not (ns.isSecret(info.itemName) or ns.isSecret(info.quality)) then
+                if key.itemSuffix ~= 0 then
+                    if type(info.itemName) == "string" then
+                        Logic.noteSuffix(db, key.itemID, key.itemSuffix, info.itemName)
+                    end
+                    local base = baseName(key.itemID)
+                    if base then Logic.noteItem(db, key.itemID, base, info.quality) end
+                elseif type(info.itemName) == "string" then
+                    Logic.noteItem(db, key.itemID, info.itemName, info.quality)
+                end
+            end
+        end
+    end
+end
+
 local function finishBrowse(run, complete, why)
     current = nil
     if not run.answered then
@@ -455,7 +600,8 @@ local function finishBrowse(run, complete, why)
         return
     end
     local results = browseResults()
-    local rows = Logic.browseRows(withoutSecrets(results))
+    local safe = withoutSecrets(results)
+    local rows = Logic.browseRows(safe)
     if #rows == 0 then
         ns.print("browse scan: no rows" .. (why and (" (" .. why .. ")") or "") .. ". Nothing was saved.")
         return
@@ -481,8 +627,15 @@ local function finishBrowse(run, complete, why)
     end
     local doc = Logic.buildDoc(run.meta, "browse", complete, run.t0, t1, rows, { uid = run.uid, rowCount = #results })
     ns.Export.save(doc)
-    -- Only after the scan is safely saved, and only for keys this scan itself returned (B6).
-    learnFromBrowse(results)
+    lastScanAt = t1 -- the market was read, complete or not: the strip counts it as this session's newest
+    -- M2: item names, quality and the full names of any suffixed keys, learned from this scan's own
+    -- results only (Ruling A/B) - after the scan is safely saved, like the variant learning right below.
+    noteBrowseNames(safe)
+    -- Only after the scan is safely saved, only for keys this scan itself returned (B6) - and only after a
+    -- scan the player asked for. The one scan that starts itself (C7) learns nothing: its whole footprint
+    -- is that one browse query and its pages, and eight item searches behind it would be a re-query loop
+    -- in shape however well bounded. The pairs are learned the next time somebody presses Browse.
+    if not run.auto then learnFromBrowse(results) end
 end
 
 ---------------------------------------------------------------------------------------------------
@@ -553,7 +706,8 @@ local function learnAnswer(itemKey)
     return true
 end
 
--- Started only by finishBrowse, with the results of the scan the player just ran.
+-- Started only by finishBrowse, with the results of the scan the player just ran - never after the scan
+-- that starts itself on AUCTION_HOUSE_SHOW, which finishBrowse keeps out by run.auto.
 function learnFromBrowse(results)
     if current then return end -- never in the way of a scan
     local baked = ns.baked
@@ -634,12 +788,19 @@ local function onBrowseResults()
     browseMore(run)
 end
 
-function Scan.browse()
+-- opts.auto marks the one scan that starts itself when the house opens (Strip.lua): the same scan in every
+-- other respect, but it does not go on to learn variant pairs - see finishBrowse. /tally browse and the
+-- Browse button pass nothing and behave exactly as they always have.
+-- -> true only when the query really went out. false when nothing was started (the reason was printed),
+-- and false too when the scan is running but the client's throttle has not taken the query yet - which a
+-- /tally browse or the Browse button is content to wait for, and the strip is not (C7 limit 6).
+function Scan.browse(opts)
     local meta = ready(BROWSE_API, BROWSE_EVENTS)
-    if not meta then return end
+    if not meta then return false end
     local now = ns.serverTime()
     local run = { kind = "browse", meta = meta, t0 = now, startedMs = ns.clockMs(), pages = 0,
         sent = false, answered = false, wantMore = false, listed = 0,
+        auto = type(opts) == "table" and opts.auto == true,
         uid = Logic.newUid(now, Logic.rand31()) }
     current = run
     ns.after(BROWSE_TIMEOUT, function()
@@ -647,10 +808,10 @@ function Scan.browse()
         finishBrowse(run, false, "gave up after " .. BROWSE_TIMEOUT .. " s")
     end)
     browseSend(run)
-    if current == run then
-        ns.print(run.sent and "browsing the whole market ... please leave the auction house search alone until it is done"
-            or "waiting for the auction house to accept a query ...")
-    end
+    if current ~= run then return false end
+    ns.print(run.sent and "browsing the whole market ... please leave the auction house search alone until it is done"
+        or "waiting for the auction house to accept a query ...")
+    return run.sent == true
 end
 
 ns.on("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED", onBrowseResults)
@@ -674,23 +835,43 @@ ns.on("AUCTION_HOUSE_BROWSE_FAILURE", function()
     finishBrowse(run, false, "the server reported a browse failure")
 end)
 
+-- Ends whatever is running, saying why. There is one such path and this is it: the auction house closing
+-- and the strip's Stop button are the same ending, so nothing can be abandoned in a way the other two
+-- kinds of ending were not written for. A browse scan keeps what it read (incomplete); a full scan in the
+-- middle of its read is told to stop at the next slice, which saves what it has, incomplete.
+local function interrupt(why)
+    local run = current
+    if not run then return false end
+    if run.kind == "ladder" then
+        current = nil
+        ns.print("basket abandoned: " .. why)
+    elseif run.kind == "learn" then
+        -- Nothing a learn run holds is worth saving, and it must not outlive the house it is searching
+        -- in: its next lookup would leave on a throttle event nobody asked for. It goes quietly - the
+        -- player never asked for it and was never told it had started.
+        current = nil
+    elseif run.kind == "browse" then
+        finishBrowse(run, false, why)
+    elseif run.kind == "replicate" then
+        run.interrupted = true
+        run.stoppedWhy = why -- a read already under way ends INCOMPLETE, and says this as the reason
+        if not run.processing then
+            current = nil
+            ns.print("full scan: " .. why .. " before the list arrived. Nothing was saved.")
+        end
+    end
+    return true
+end
+
+-- The Stop button on the auction house strip (C7's "visible while it runs, with a Stop button").
+function Scan.stop()
+    return interrupt("you stopped it")
+end
+
 -- Core's own handler for this event runs first, so ns.ahOpen is already false here.
 ns.on("AUCTION_HOUSE_CLOSED", function()
     late = nil -- whatever list arrives after this is not read
-    local run = current
-    if not run then return end
-    if run.kind == "ladder" then
-        current = nil
-        ns.print("basket abandoned: the auction house was closed")
-    elseif run.kind == "browse" then
-        finishBrowse(run, false, "the auction house was closed")
-    elseif run.kind == "replicate" then
-        run.interrupted = true
-        if not run.processing then
-            current = nil
-            ns.print("full scan: the auction house was closed before the list arrived. Nothing was saved.")
-        end
-    end
+    interrupt("the auction house was closed")
 end)
 
 ---------------------------------------------------------------------------------------------------
