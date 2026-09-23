@@ -7,7 +7,10 @@
 --     alone, once per opening of the auction house (C7 as revised 2026-09-23: the six limits on that
 --     one are all in Strip.lua; nothing in this file decides it). Event handlers and timers below do
 --     nothing unless such a scan is running, and then they only carry that one scan forward. Nothing
---     re-arms itself.
+--     re-arms itself. The one thing this file does decide about that scan is the single wait the owner
+--     amended C7 with on 2026-09-23: a run marked `auto` whose query the client would not take at the
+--     opening gets ONE attempt on the first AUCTION_HOUSE_THROTTLED_SYSTEM_READY and is then over
+--     (run.waitedOnce, in that handler below). It is still one query per opening either way.
 --   * Player names are never read: the four name positions of a replicate row are discarded in
 --     the assignment itself, and only itemKey / minPrice / totalQuantity of a browse row are read.
 --   * One request per player action for the full scan, with a self-imposed cooldown; browse pages
@@ -32,6 +35,8 @@ local SETTLE_BUDGET = 60      -- ... or this long after the first list event if 
 local REPLICATE_TIMEOUT = 30  -- no list event by then: say so, and let the player do something else
 local LATE_LIMIT = 300        -- a list that arrives within this long of the request is still read
 local LINK_RETRY_SECONDS = 1  -- rows whose item link was not loaded are looked at once more after this
+local NO_LINK_MIN = 10        -- rows still without a link after that are tolerated: this many at least,
+local NO_LINK_SHARE = 0.001   -- ... or this share of the list, whichever is more (see finishReplicate)
 local SIGNATURE_MIN_ROWS = 50 -- lists this long are compared with the last one read (see lastSignature)
 local BROWSE_TIMEOUT = 180
 local BROWSE_MAX_PAGES = 400
@@ -45,6 +50,12 @@ local late    -- a full scan whose list had not arrived after REPLICATE_TIMEOUT.
 -- scan document is saved and nowhere else: a synthetic /tally selftest is no scan of a market and must
 -- never hold the next real one off. The strip reads it through Scan.status (C7's 30-minute limit).
 local lastScanAt = 0
+
+-- True once the scan that started itself has spent its one wait (C7 as amended) without the client taking
+-- the query. The strip reads it through Scan.status to tell "this opening is refused" from "this opening is
+-- done", which is its decision to make, not this file's; cleared when the house closes, with everything
+-- else about an opening.
+local autoGaveUp = false
 
 local ladderNext -- defined with the price ladders further down; the throttle handler above them calls it
 -- Defined with the variant learning further down, but finishBrowse - above it - starts it. A Lua local
@@ -67,27 +78,21 @@ end
 
 -- What the auction house strip shows (Strip.lua). Read-only, and busy is only ever about a scan of the
 -- market: the short learn and ladder runs are nothing the Stop button should offer to end.
--- -> { busy, kind, pages, lastScanAt }
+-- -> { busy, kind, pages, waiting, autoGaveUp, lastScanAt }
 function Scan.status()
     local run = current
     local scanning = run ~= nil and (run.kind == "replicate" or run.kind == "browse")
+    -- A browse run whose one query has not gone out yet: live, visible and stoppable, but not yet scanning
+    -- anything. True of a clicked Browse waiting on the throttle and of the amended auto scan alike.
+    local waiting = scanning and run.kind == "browse" and run.sent ~= true
     return {
         busy = scanning,
         kind = scanning and run.kind or nil,
         pages = scanning and run.pages or nil,
+        waiting = waiting,
+        autoGaveUp = autoGaveUp,
         lastScanAt = lastScanAt,
     }
-end
-
--- Whether the client would take a query this instant. Its own throttle is what refuses one: a scan the
--- player asked for waits for it (browseSend below), and the strip - which nobody clicked - does not, so
--- that no query of its making can ever leave on a later event (C7 limits 1 and 6).
-function Scan.throttleReady()
-    if type(C_AuctionHouse) ~= "table" or type(C_AuctionHouse.IsThrottledMessageSystemReady) ~= "function" then
-        return false
-    end
-    local ok, ready = pcall(C_AuctionHouse.IsThrottledMessageSystemReady)
-    return ok and ready == true
 end
 
 -- Called by Core after any error: never stay busy.
@@ -223,14 +228,28 @@ local function finishReplicate(run, agg, n, unreadable, noLink)
     end
     if run.signature ~= nil then lastSignature = run.signature end
     -- An item missing from a complete scan reads as "sold out" on the server, so a scan that had to
-    -- drop a row (no item id, no link, a secret value, a count or buyout the server would refuse),
-    -- or whose list was not the same length after the read as before it, must not claim to be
-    -- complete. Bid-only rows are not dropped rows: they have no buyout to record.
+    -- drop a row (no item id, a secret value, a count or buyout the server would refuse), or whose
+    -- list was not the same length after the read as before it, must not claim to be complete.
+    -- Bid-only rows are not dropped rows: they have no buyout to record.
+    -- Rows whose item link never loaded are the ONE tolerated kind, up to NO_LINK_MIN or NO_LINK_SHARE
+    -- of the list, whichever is more (live finding 2026-09-23: a 67,613-row scan was thrown away whole
+    -- over 7 of them). The client was still loading those items; that is not a scan that missed part of
+    -- the market. The cost is bounded and self-repairing: those few items may read as sold out on the
+    -- server for one scan, and the next scan puts them back. A scan missing more than that is still
+    -- incomplete, and so is any scan with an unreadable or refusable row - those are rows we could not
+    -- trust, not rows that had not arrived. The document reports noLink either way.
     -- run.readOk and run.finalCount were taken when the last row was read, one frame ago: closing
     -- the auction house after that does not make a whole scan incomplete.
-    local dropped = unreadable + noLink + agg.invalid
+    local tolerated = math.max(NO_LINK_MIN, math.floor(n * NO_LINK_SHARE))
+    -- The rows that really could not be read, which is what the reason below counts. Tolerated unloaded
+    -- links are NOT among them: counting those would blame a handful of innocent rows for a scan that was
+    -- cut short or whose list would not hold still, and hide the real cause behind a number that reads
+    -- like a failure to read. Past the tolerance they are the cause, and they are counted.
+    local untrusted = unreadable + agg.invalid
+    if noLink > tolerated then untrusted = untrusted + noLink end
     local complete = run.readOk == true and (not run.unstable)
-        and dropped == 0 and agg.rowCount == n and run.finalCount == n
+        and untrusted == 0
+        and agg.rowCount == n - noLink and run.finalCount == n
     ns.print(string.format("full scan: %.0f auctions -> %.0f rows, %.0f item keys, %.0f bid-only, %.0f without a link, %.1f s",
         agg.rowCount, #rows, agg:keyCount(), agg.bidOnly, noLink, seconds(run)))
     if not complete then
@@ -239,10 +258,12 @@ local function finishReplicate(run, agg, n, unreadable, noLink)
             -- Cut short mid-read: by whatever ended it (interrupt records that), or by the house being
             -- shut without one - which only leaves ns.ahOpen false, and is the case the fallback names.
             why = run.stoppedWhy or "the auction house was closed"
-        elseif dropped > 0 then
-            why = string.format("%.0f of %.0f rows could not be read", dropped, n)
+        elseif untrusted > 0 then
+            why = string.format("%.0f of %.0f rows could not be read", untrusted, n)
         end
-        ns.print("INCOMPLETE (" .. why .. "): saved for the record, but the server will not use its prices")
+        -- Since 0.9.1 the server keeps a cut-short full scan's prices and only declines to mark anything sold
+        -- out from it; a cut-short BROWSE scan (finishBrowse) is still set aside whole.
+        ns.print("INCOMPLETE (" .. why .. "): saved - the server keeps its prices but marks nothing sold out")
     end
     local t1 = ns.serverTime()
     local doc = Logic.buildDoc(run.meta, "replicate", complete, run.t0, t1, rows, {
@@ -789,11 +810,12 @@ local function onBrowseResults()
 end
 
 -- opts.auto marks the one scan that starts itself when the house opens (Strip.lua): the same scan in every
--- other respect, but it does not go on to learn variant pairs - see finishBrowse. /tally browse and the
--- Browse button pass nothing and behave exactly as they always have.
--- -> true only when the query really went out. false when nothing was started (the reason was printed),
--- and false too when the scan is running but the client's throttle has not taken the query yet - which a
--- /tally browse or the Browse button is content to wait for, and the strip is not (C7 limit 6).
+-- other respect, but it waits at most once for the client (the throttle handler below) and it does not go
+-- on to learn variant pairs - see finishBrowse. /tally browse and the Browse button pass nothing and behave
+-- exactly as they always have.
+-- -> true when a run of THIS call's making is live: its query already out, or waiting for the client to
+-- take it. false only when nothing was started at all and the reason was printed - there is then no run of
+-- ours to stop, to wait for or to report on. This is the one place that answer is decided.
 function Scan.browse(opts)
     local meta = ready(BROWSE_API, BROWSE_EVENTS)
     if not meta then return false end
@@ -801,6 +823,7 @@ function Scan.browse(opts)
     local run = { kind = "browse", meta = meta, t0 = now, startedMs = ns.clockMs(), pages = 0,
         sent = false, answered = false, wantMore = false, listed = 0,
         auto = type(opts) == "table" and opts.auto == true,
+        waitedOnce = false, -- the amended C7's single wait, spent in the throttle handler below
         uid = Logic.newUid(now, Logic.rand31()) }
     current = run
     ns.after(BROWSE_TIMEOUT, function()
@@ -808,10 +831,10 @@ function Scan.browse(opts)
         finishBrowse(run, false, "gave up after " .. BROWSE_TIMEOUT .. " s")
     end)
     browseSend(run)
-    if current ~= run then return false end
+    if current ~= run then return false end -- the request itself failed: nothing of ours is running
     ns.print(run.sent and "browsing the whole market ... please leave the auction house search alone until it is done"
         or "waiting for the auction house to accept a query ...")
-    return run.sent == true
+    return true
 end
 
 ns.on("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED", onBrowseResults)
@@ -822,10 +845,19 @@ ns.on("AUCTION_HOUSE_THROTTLED_SYSTEM_READY", function()
     if run and run.kind == "learn" then return learnNext(run) end
     if run and run.kind == "ladder" then return ladderNext(run) end
     if not run or run.kind ~= "browse" then return end
-    if not run.sent then
-        browseSend(run)
-    else
-        browseMore(run)
+    if run.sent then return browseMore(run) end
+    -- Not sent yet. A scan the player asked for waits here as long as it takes - it is their query, and
+    -- they were told it is waiting. The one scan that starts itself gets exactly ONE attempt (C7 as
+    -- amended by the owner 2026-09-23): waitedOnce goes up BEFORE the send, so a second ready signal can
+    -- never reach this again, and a client that still will not take the query ends the scan for this
+    -- opening rather than leaving it queued for a third.
+    if not run.auto then return browseSend(run) end
+    if run.waitedOnce then return end
+    run.waitedOnce = true
+    browseSend(run)
+    if current == run and not run.sent then
+        autoGaveUp = true -- the strip reads this and records the opening as refused, not as done
+        finishBrowse(run, false, "the house was busy")
     end
 end)
 
@@ -871,6 +903,7 @@ end
 -- Core's own handler for this event runs first, so ns.ahOpen is already false here.
 ns.on("AUCTION_HOUSE_CLOSED", function()
     late = nil -- whatever list arrives after this is not read
+    autoGaveUp = false -- a fact about the opening that is ending, and about nothing else
     interrupt("the auction house was closed")
 end)
 

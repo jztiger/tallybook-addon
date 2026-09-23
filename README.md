@@ -31,12 +31,14 @@ A small strip appears beside the auction house window:
 - **Stop** shows up only while a scan is running, and ends it right there.
 - An **auto-scan** checkbox, on by default: while it's ticked, opening the auction house runs one Browse scan by
   itself - once per visit, and never while the newest scan anyone in the group has made is under 30 minutes old,
-  so a handful of people visiting an auctioneer make a handful of scans a day, not dozens. Untick it and the
-  automatic scan stops; the two buttons keep working either way.
-- One status line says what's happening: `scanning ... page 3` while a scan runs, `last scan 6h ago` when the
-  last one is old news, `the house is busy - try the button in a moment` if the game's own cooldown just turned
-  a query away (it isn't tried again until you close and reopen the house), or `no prices yet - press Browse`
-  the first time.
+  so a handful of people visiting an auctioneer make a handful of scans a day, not dozens. The scan may start a
+  second or two after the house opens rather than the instant it does: the game's own auction house window
+  usually spends the client's one query allowance first, so the scan waits for the client to say it is free -
+  once. Untick it and the automatic scan stops; the two buttons keep working either way.
+- One status line says what's happening: `waiting for the house to accept a query` while the scan waits for the
+  client, `scanning ... page 3` while a scan runs, `last scan 6h ago` when the last one is old news, `the house
+  is busy - try the button in a moment` if the game's own cooldown turned the query away even then (it isn't
+  tried again until you close and reopen the house), or `no prices yet - press Browse` the first time.
 
 Opening a profession window also reads its recipes, every time - nothing to type there either. A line beside the
 **Profit** button confirms it: `✓ learned 41 recipes, 3 new`.

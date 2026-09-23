@@ -5,9 +5,14 @@
 -- Display, and one decision that is not taken here: whether that scan may run is Logic.autoScanDecision,
 -- which is pure and tested on its own. This file gathers the six fields it takes and obeys what it says.
 -- The six limits C7 keeps, and the line here that keeps each:
---   1. The TRIGGER is AUCTION_HOUSE_SHOW and nothing else: the handler at the foot of this file is the
---      only caller of startAutoScan(), and there is no timer, no repeat and no retry anywhere in it.
---      Note what this does NOT claim: a browse scan is paged, so pages 2..N of a scan that HAS started
+--   1. The trigger to start is AUCTION_HOUSE_SHOW; if the client is busy at that instant the one query
+--      goes out on its first ready signal, once (owner's amendment 2026-09-23). The handler at the foot of
+--      this file is the only caller of startAutoScan(), and there is no timer, no repeat and no retry
+--      anywhere in it. The wait is Scan.lua's (run.waitedOnce, its AUCTION_HOUSE_THROTTLED_SYSTEM_READY
+--      handler): one attempt on the client's FIRST ready signal, and the scan is over either way - the
+--      amendment was the owner's answer to the live finding that Blizzard's own window spends the query
+--      allowance the instant the house opens, so the pre-check this file used to make refused every time.
+--      Note what none of this claims: a browse scan is paged, so pages 2..N of a scan that HAS started
 --      are asked for on later events (Scan.lua's browseMore, from the results and throttle handlers),
 --      exactly as they are for a /tally browse. That is the browse scan limit 4 names, and it is bounded
 --      by that one scan's own paging - it starts nothing new.
@@ -19,14 +24,15 @@
 --      behind its own button and /tally scan. The whole footprint of this scan is that ONE browse query
 --      and its pages: it is marked `auto`, and Scan.lua's finishBrowse keeps the variant learner - up to
 --      eight item searches - for the scans somebody pressed a button for.
---   5. Visible: paint() writes "scanning ..." and shows the Stop button for as long as a scan runs.
---   6. A query the client REFUSES is never taken up again - not on the throttle's own event, not on a
---      second AUCTION_HOUSE_SHOW, not ever until the house has been closed and opened again. A /tally
---      browse may wait for the throttle to clear, because a player asked for it; a scan of the strip's
---      may not. Two things make that so, and the second is what enforces it: the throttle pre-check in
---      startAutoScan() means no such run is normally created, and any run whose query did not go out is
---      ENDED there (ns.Scan.stop) rather than left for the throttle handler to pick up. opening.refused
---      is recorded either way, and the decision then answers "skip-cooldown".
+--   5. Visible: paint() writes "waiting for the house to accept a query" while it waits and "scanning ..."
+--      once the query is out, and shows the Stop button for as long as either lasts.
+--   6. No second wait, no retry. The one wait of limit 1 is the whole allowance: a client that still will
+--      not take the query at its own ready signal ends the scan for this opening - not on a later ready
+--      signal, not on a second AUCTION_HOUSE_SHOW, not ever until the house has been closed and opened
+--      again. Scan.lua enforces it (run.waitedOnce is raised before the send, so the handler cannot reach
+--      the same run twice, and a run that did not send is ENDED there rather than left queued); this file
+--      only records what it meant for the opening - opening.refused, on which the decision answers
+--      "skip-cooldown". A /tally browse still waits as long as the player likes: they asked for it.
 -- The switch is ns.settings().autoScan, remembered by ns.setSetting like every other choice.
 --
 -- Nothing here posts, bids, buys or cancels, and nothing here asks the auction house for anything: the
@@ -44,10 +50,12 @@ local BUTTON_W, BUTTON_H = 60, 22
 local WIDTH, HEIGHT = 190, 76
 
 -- What is true of THIS opening of the auction house. Either one is enough to stop a second scan, and only
--- AUCTION_HOUSE_CLOSED clears them - with one exception, inside startAutoScan: a scan that was asked for
--- but whose query did not go out puts `scanned` back down and `refused` up in the same breath, so what the
--- player is told is "the house is busy" rather than "already done". The opening is no less closed to a
--- second scan for it: decide() weighs `refused` right after `scanned`, and both answer skip.
+-- AUCTION_HOUSE_CLOSED clears them - with one exception, in the two places marked "refused" below: a scan
+-- that was asked for but whose query never went out puts `scanned` back down and `refused` up in the same
+-- breath, so what the player is told is "the house is busy" rather than "already done". Both halves matter:
+-- decide() weighs `scanned` BEFORE `refused`, so leaving `scanned` up would answer "skip-done" and the
+-- status line would say nothing about a busy house. The opening is no less closed to a second scan for it -
+-- both answers skip.
 local opening = { scanned = false, refused = false }
 
 local strip, cannotBuild
@@ -131,6 +139,9 @@ end
 -- otherwise the player is told why no scan started, or how old the prices they are looking at are.
 local function statusText(status)
     if status.busy then
+        -- A browse run whose query the client has not taken yet: the single wait of limit 1, and the wait a
+        -- clicked Browse has always been allowed. Either way there is something running to see and to stop.
+        if status.waiting then return "waiting for the house to accept a query" end
         if status.kind == "browse" and type(status.pages) == "number" and status.pages > 0 then
             return string.format("scanning ... page %.0f", status.pages)
         end
@@ -237,35 +248,23 @@ end
 
 -- Starts the one scan C7 allows without a click - not to be read as autoScanOn(), which is only the
 -- switch this consults. Called from the AUCTION_HOUSE_SHOW handler below and from nowhere else. It asks
--- once, it never waits and it never repeats: whatever comes of this one attempt stands until the house is
--- closed and opened again. A strip that could not be built means no auto-scan at all - nothing the player
--- cannot see and cannot stop may start on its own.
+-- once and it never repeats: whatever comes of this one attempt - the query now, the query on the client's
+-- first ready signal, or nothing at all - stands until the house is closed and opened again. A strip that
+-- could not be built means no auto-scan at all: nothing the player cannot see and cannot stop may start on
+-- its own.
 local function startAutoScan()
     local status = ns.Scan.status()
     if decide(status) ~= "scan" then return end
-    -- Limit 6: the auction house's own throttle is the cooldown. The Browse button may wait for it to
-    -- clear; this may not, because the query would then go out on the throttle's own event rather than
-    -- on the opening of the house (limit 1). A shut throttle is a refusal, recorded and not retried.
-    if not ns.Scan.throttleReady() then
-        opening.refused = true
-        return
-    end
     opening.scanned = true -- limit 2: written before the scan is asked for, so nothing can ask twice
-    -- Limit 4: the browse scan, through the very function the Browse button and /tally browse call, so
-    -- it passes the same checks they do. It answers false when the query did not go out, and then this
-    -- opening has had its one attempt refused rather than taken.
-    -- Anything running after this call that was not running before it can only be the run this call made:
-    -- that, and only that, is what the stop below is allowed to end.
-    local wasBusy = ns.Scan.busy()
+    -- Limit 4: the browse scan, through the very function the Browse button and /tally browse call, so it
+    -- passes the same checks they do. It answers true when a run of its own making is live - the query
+    -- already out, or waiting for the client to take it, which limit 1 as amended allows exactly once and
+    -- Scan.lua alone carries out. false is the one case where nothing of ours exists at all: the scan was
+    -- refused outright, most often because a full scan the player started is still reading its list (that
+    -- outlives the house closing, so an opening can find one going). Nothing to stop and nothing to wait
+    -- for, so the opening has had its attempt - refused, not taken.
     if ns.Scan.browse({ auto = true }) ~= true then
-        -- false covers three cases: nothing was started; a run IS live but the client would not take its
-        -- query; and the scan was refused because something else is already running. The second is the
-        -- dangerous one - a live unsent browse run is precisely what AUCTION_HOUSE_THROTTLED_SYSTEM_READY
-        -- picks up and sends - so it is ended here rather than left queued. The third must NOT be stopped:
-        -- a full scan reading its list outlives the house closing, so an opening can find one still going,
-        -- and it is the player's.
-        if not wasBusy then ns.Scan.stop() end
-        opening.scanned = false
+        opening.scanned = false -- "refused": see the note on `opening` above - both halves, together
         opening.refused = true
     end
 end
@@ -274,6 +273,19 @@ ns.on("AUCTION_HOUSE_SHOW", function()
     Strip.attach()
     if not strip then return end
     startAutoScan()
+    paint()
+end)
+
+-- The single wait of limit 1, once it is over. Scan.lua's own handler for this event ran first (the .toc
+-- loads it first), so by now the scan has either sent its query or given up for good; this decides only
+-- what that meant for the opening, which is this file's business and not Scan.lua's. Repainting is the
+-- rest of it: a wait that ended has to stop showing as a wait. Registering for an event is not owning a
+-- clock - nothing here is scheduled, and the player's own client is what decides when this arrives.
+ns.on("AUCTION_HOUSE_THROTTLED_SYSTEM_READY", function()
+    if strip and ns.Scan.status().autoGaveUp then
+        opening.scanned = false -- "refused": see the note on `opening` above - both halves, together
+        opening.refused = true
+    end
     paint()
 end)
 
