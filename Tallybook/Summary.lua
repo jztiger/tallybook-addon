@@ -126,7 +126,7 @@ local function compute()
 
     local index, outputs = Logic.recipeIndex(db.recipes)
     local rows
-    rows, counts = Logic.profitSummary(wanted, index, outputs, db.prices, db.vendor, db.listed)
+    rows, counts = Logic.profitSummary(wanted, index, outputs, db.prices, db.vendor, db.listed, db.market)
     for i = 1, #rows do
         local row = rows[i]
         row.name = names[row.recipeID] or ns.UI.itemName(row.itemID)
@@ -139,6 +139,14 @@ local function costText(row)
     if row.missing == 0 then return ns.UI.money(row.cost) end
     if row.cost == 0 then return "?" end
     return ns.UI.money(row.cost) .. " +?"
+end
+
+-- M3: what the craft sells for. The server's market value where there is one; today's cheapest listing
+-- otherwise, marked "(now)" so a figure that is only what somebody happens to be asking today never reads
+-- as what the item is worth.
+local function saleText(row)
+    if not row.sale then return "-" end
+    return ns.UI.money(row.sale) .. (row.saleFrom == "now" and " (now)" or "")
 end
 
 local function resultText(row)
@@ -235,7 +243,7 @@ local function paint()
         if data then
             row.name:SetText(data.name)
             row.cost:SetText(costText(data))
-            row.sale:SetText(data.sale and ns.UI.money(data.sale) or "-")
+            row.sale:SetText(saleText(data))
             row.listed:SetText(data.listed and string.format("%.0f", data.listed) or "-")
             row.result:SetText(resultText(data))
             row:Show()

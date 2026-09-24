@@ -62,6 +62,23 @@ Known limit of the current beta build: the game does not read addon saved data b
 session needs one scan - automatic on opening the auction house, or by hand with the button or the command above.
 `Data.lua` is where learned vendor prices and recipes are handed back as code; the copy here is empty.
 
+## Your mailbox
+
+When you open your mailbox, Tallybook reads what it's already showing you: for a sold auction, the item, the
+count, the price you received, the deposit and the auction house's cut; for one that expired or was
+cancelled, the item and the count. It also reads how many days the mail has left, only so it can tell the
+same mail apart from a new one later - not something it shows you. It reads while the mailbox is open, and
+only because you opened it: nothing happens while it's closed, and nothing goes anywhere until you press
+**Send** (or `/tally reload`), same as everything else it learns. It never reads or stores who bought
+anything, who sent a mail, or any other player's name. A mail from anyone titled `Auction expired: <name>` or
+`Auction cancelled: <name>` is filed as a returned auction under that name, on your own Sales page only - it
+never enters the group's figures.
+
+With the tray app and a membership, your own sales and returns then show up in detail on the site - to you
+alone. The group only ever sees a median price and how many sold, per item, never whose. In game, the
+tooltip's `Market:` line gains a sale rate (`Market 16g 95s · sells ~3.2/day`), and the Profit line marks
+itself `(now)` when there isn't yet enough history for a market value, using today's price instead.
+
 ## The tray app (`tray/`)
 
 Optional. A small Windows program (C#, .NET Framework 4.8) for members of our group: it sends the addon's saved file to

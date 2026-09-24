@@ -47,7 +47,13 @@ function List.costText(recipeID)
         return ns.UI.money(total) .. " +?"
     end
     local itemID = outputs[recipeID]
-    local profit = Logic.craftingProfit(total, missing, entry.qty, itemID and type(db.prices) == "table" and db.prices[itemID] or nil)
+    -- M3, fix round 1: the server's market value where there is one, today's cheapest listing otherwise -
+    -- the order Logic.profitSummary and UI.craftLine both use. This number and the Profit panel's are on
+    -- screen together, off the same profession window, so they price the same recipe the same way.
+    local market = itemID and type(db.market) == "table" and db.market[itemID] or nil
+    local price = (type(market) == "number" and market > 0) and market
+        or (itemID and type(db.prices) == "table" and db.prices[itemID] or nil)
+    local profit = Logic.craftingProfit(total, missing, entry.qty, price)
     if not profit then return ns.UI.money(total) end
     local colour = profit >= 0 and GREEN or RED
     if ns.settings().list == "cost" then return colour .. ns.UI.money(total) .. CLOSE end

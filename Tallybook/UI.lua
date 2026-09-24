@@ -1,6 +1,7 @@
 -- Tallybook: what the player sees on item tooltips, and the /tally status lines.
 --
 --   Min AH Price: 45s (7m)                                  cheapest listing, from the last browse scan
+--   Market: 52s · sells ~3.2/day                            what the server worked out, from Data.lua (M3)
 --   Vendor: 10c                                             when a visited vendor sells it
 --   Crafting Cost: 4s 90c                  Profit: 37s 85c  green, or "Loss: ..." in red: crafting to sell at the
 --     4 x Medium Leather @ 1s 20c                   4s 80c  Min AH Price, less the auction house's cut. Left out
@@ -23,6 +24,7 @@ ns.UI = UI
 local LABEL = "|cff33ff99Min AH Price|r: "
 local CRAFT_LABEL = "|cff33ff99Crafting Cost|r: "
 local VENDOR_LABEL = "|cff33ff99Vendor|r: "
+local MARKET_LABEL = "|cff33ff99Market|r: "
 local PROFIT, LOSS, DIM, CLOSE = "|cff00ff00Profit: ", "|cffff2020Loss: ", "|cff808080", "|r"
 
 ---------------------------------------------------------------------------------------------------
@@ -55,16 +57,37 @@ function UI.priceSource(before, after)
     return (before or "") .. from .. (after or "")
 end
 
--- -> the line for this item, or nil when there is no price for it
+-- -> the line for this item, or nil when there is no price for it, THEN (M3) the market line, or nil when
+-- the data file has no market value for it. Two separate answers: an item nobody is selling today can
+-- still have a market value, and a market value is not "what it costs right now".
 function UI.priceLine(itemID)
     if ns.isSecret(itemID) or type(itemID) ~= "number" then return nil end
     local db = TallybookDB
     if type(db) ~= "table" or type(db.prices) ~= "table" then return nil end
+    local line
     local price = db.prices[itemID]
-    if type(price) ~= "number" or price <= 0 then return nil end
-    local line = LABEL .. money(price)
-    if type(db.pricesAt) == "number" and db.pricesAt > 0 then
-        line = line .. " (" .. Logic.formatAge(ns.serverTime() - db.pricesAt) .. UI.priceSource(", ") .. ")"
+    if type(price) == "number" and price > 0 then
+        line = LABEL .. money(price)
+        if type(db.pricesAt) == "number" and db.pricesAt > 0 then
+            line = line .. " (" .. Logic.formatAge(ns.serverTime() - db.pricesAt) .. UI.priceSource(", ") .. ")"
+        end
+    end
+    return line, UI.marketLine(itemID)
+end
+
+-- -> "Market: <value> · sells ~N.N/day", the two figures the server works out and sends back in Data.lua
+-- (spec 2026-09-24 section 5). The sale rate travels x100 as a whole number, so it is divided here; it is
+-- left off entirely when the server has none, and 0.0/day is a real answer rather than a missing one.
+function UI.marketLine(itemID)
+    if ns.isSecret(itemID) or type(itemID) ~= "number" then return nil end
+    local db = TallybookDB
+    if type(db) ~= "table" or type(db.market) ~= "table" then return nil end
+    local value = db.market[itemID]
+    if type(value) ~= "number" or value <= 0 then return nil end
+    local line = MARKET_LABEL .. money(value)
+    local sells = type(db.sells) == "table" and db.sells[itemID] or nil
+    if type(sells) == "number" and sells >= 0 then
+        line = line .. " · sells ~" .. string.format("%.1f", sells / 100) .. "/day"
     end
     return line
 end
@@ -120,8 +143,14 @@ function UI.craftLine(itemID)
     if each ~= total then line = line .. " (" .. money(each) .. " each)" end
     if missing > 0 then line = line .. " + " .. unpriced(missing) end
 
+    -- M3, fix round 1: what one sells for is the server's market value when there is one, today's cheapest
+    -- listing when there is not - the same order Logic.profitSummary uses for the Profit panel. Hovering a
+    -- row of that panel shows this tooltip, so the two must never quote different profits for one recipe.
     local result
-    local profit = Logic.craftingProfit(total, missing, recipe.qty, type(db.prices) == "table" and db.prices[itemID] or nil)
+    local market = type(db.market) == "table" and db.market[itemID] or nil
+    local price = (type(market) == "number" and market > 0) and market
+        or (type(db.prices) == "table" and db.prices[itemID] or nil)
+    local profit = Logic.craftingProfit(total, missing, recipe.qty, price)
     if profit then
         result = (profit >= 0 and (PROFIT .. money(profit)) or (LOSS .. money(-profit))) .. CLOSE
     end
@@ -144,8 +173,9 @@ end
 
 local function addLine(tooltip, itemID)
     if type(tooltip) ~= "table" or type(tooltip.AddLine) ~= "function" then return end
-    local line = UI.priceLine(itemID)
+    local line, market = UI.priceLine(itemID)
     if line then tooltip:AddLine(line) end
+    if market then tooltip:AddLine(market) end
     local vendor = UI.vendorLine(itemID)
     if vendor then tooltip:AddLine(vendor) end
     local craft, result, mats = UI.craftLine(itemID)

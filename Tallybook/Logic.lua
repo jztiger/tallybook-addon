@@ -9,13 +9,13 @@ ns = ns or {}
 local L = {}
 ns.Logic = L
 
-L.VERSION = "0.9.3"
+L.VERSION = "0.10.0"
 -- Two independent version counters, mirroring the server (src/shared/scan-schema.ts SCAN_SCHEMA_VERSION,
 -- src/shared/ref-doc.ts REF_SCHEMA_VERSION): the scan document's shape (replicate, browse) has not changed
 -- since M1, so buildDoc still tags SCAN_SCHEMA; the reference document gained items, suffixes and named
--- recipes in M2, so refDoc tags SCHEMA.
+-- recipes in M2 and the member's own sales in M3, so refDoc tags SCHEMA.
 L.SCAN_SCHEMA = 1
-L.SCHEMA = 2
+L.SCHEMA = 3
 L.REPLICATE_COOLDOWN = 900
 -- What the auction house keeps of a sale, in percent. MEASURED at 5 on Forever, 2026-09-22: a sale of
 -- 2100 copper returned 2337 after a 105 copper cut (docs/research/2026-09-22-ah-cut-and-deposit.md).
@@ -38,6 +38,10 @@ L.PRICES_MAX_AGE = 604800
 L.MAX_ITEM_ROWS = 20000
 L.MAX_SUFFIX_ROWS = 20000
 L.MAX_NAME_CHARS = 128
+-- M3: the player's own auction outcomes, read from their own mailbox (spec 2026-09-24 section 4). Mirrors
+-- MAX_SALE_ROWS in src/shared/ref-doc.ts; one session's mailbox is never remotely this large.
+L.MAX_SALE_ROWS = 5000
+local OUTCOMES = { sold = true, returned = true }
 
 -- The server refuses any number that is not a safe integer (2^53 - 1).
 local MAX_SAFE = 9007199254740991
@@ -483,6 +487,11 @@ function L.initDB(db)
     if type(db.settings) ~= "table" then db.settings = {} end
     if type(db.items) ~= "table" then db.items = {} end
     if type(db.suffixes) ~= "table" then db.suffixes = {} end
+    -- M3: the player's own sales and returns, keyed by the dedup key (see L.noteSale), and the two figures
+    -- the server works out and hands back in Data.lua: market value per unit, and sales per day x100.
+    if type(db.sales) ~= "table" then db.sales = {} end
+    if type(db.market) ~= "table" then db.market = {} end
+    if type(db.sells) ~= "table" then db.sells = {} end
     -- where the prices came from when not from this session's own scan: the data file's "saved" or "shared"
     if db.pricesFrom ~= "saved" and db.pricesFrom ~= "shared" then db.pricesFrom = nil end
     return db
@@ -638,6 +647,37 @@ function L.noteSuffix(db, itemID, suffixID, fullName)
     return true
 end
 
+-- One of the player's OWN auction outcomes, read out of their own mailbox (M3, spec 2026-09-24 section 4).
+-- Mail.lua does the reading; this is the bookkeeping, and knows nothing about the client.
+--
+-- itemID is a real id or 0 (Forever's invoice carries none, so the server matches by name); itemName is
+-- 1..MAX_NAME_CHARS bytes; count is at least 1; price, deposit and cut are copper and never negative (a
+-- returned auction's price is 0); outcome is "sold" or "returned"; expiresAt is the mail's own expiry, a
+-- positive whole second.
+--
+-- DEDUP: this API gives a mail no id, so the same mail seen on two visits - or in two sessions - has to
+-- collapse to one row. What does not change while a mail sits in the box is its expiry, which was fixed when
+-- the auction was posted: itemName, count, price, expiry and outcome together identify one mail. Mail.lua
+-- rounds the expiry to the minute so that counting down between visits does not make a second row. Two
+-- identical sales mailed within the same minute collapse into one; that is stated in the spec (section 9)
+-- and the count field keeps stack totals honest. The server's UNIQUE index is the real guard across
+-- sessions; this only keeps one document from carrying the same mail twice.
+-- -> true when recorded
+function L.noteSale(db, itemID, itemName, count, price, deposit, cut, outcome, expiresAt)
+    if type(db) ~= "table" or type(db.sales) ~= "table" then return false end
+    if not isCount(itemID, 0) or not validName(itemName) or not isCount(count, 1) then return false end
+    if not isCount(price, 0) or not isCount(deposit, 0) or not isCount(cut, 0) then return false end
+    if not OUTCOMES[outcome] or not isCount(expiresAt, 1) then return false end
+    local key = itemName .. ":" .. string.format("%d", count) .. ":" .. string.format("%d", price)
+        .. ":" .. string.format("%d", expiresAt) .. ":" .. outcome
+    if db.sales[key] ~= nil then return false end
+    db.saleCount = db.saleCount or tableSize(db.sales) -- see L.noteItem
+    if db.saleCount >= L.MAX_SALE_ROWS then return false end
+    db.sales[key] = { itemID, itemName, count, price, deposit, cut, outcome, expiresAt }
+    db.saleCount = db.saleCount + 1
+    return true
+end
+
 -- One merchant row -> the copper price of ONE item, or nil when it is not a plain, always-available gold
 -- purchase (another currency, or limited stock that may not be there next time).
 function L.vendorUnitPrice(item)
@@ -754,7 +794,10 @@ end
 --          why = "mats" | "nosale" }, counts { profit, loss, unknown }
 -- sale is what the recipe makes at the cheapest listing, before the cut; profit is after it. Breaking even is
 -- a profit. A recipe never read, or one that makes no item, is left out: there is nothing honest to say.
-function L.profitSummary(recipeIDs, index, outputs, prices, vendor, listed)
+-- market (M3) is the server's market value per unit, from the data file. When it has a figure for the item
+-- that is what a craft sells for, and the profit follows from it; otherwise today's cheapest listing stands
+-- in and the row says so (row.saleFrom = "now"), because the two are not the same claim.
+function L.profitSummary(recipeIDs, index, outputs, prices, vendor, listed, market)
     local rows, counts = {}, { profit = 0, loss = 0, unknown = 0 }
     if type(recipeIDs) ~= "table" or type(index) ~= "table" or type(outputs) ~= "table" then return rows, counts end
     for i = 1, #recipeIDs do
@@ -765,10 +808,13 @@ function L.profitSummary(recipeIDs, index, outputs, prices, vendor, listed)
             local qty = isCount(entry.qty, 1) and entry.qty or 1
             local row = { recipeID = recipeID, itemID = itemID, qty = qty, cost = cost, missing = missing }
             if type(listed) == "table" and isCount(listed[itemID], 0) then row.listed = listed[itemID] end
-            local price = type(prices) == "table" and prices[itemID] or nil
+            local price, from = type(market) == "table" and market[itemID] or nil, "market"
+            if not isCount(price, 1) then
+                price, from = type(prices) == "table" and prices[itemID] or nil, "now"
+            end
             local profit = L.craftingProfit(cost, missing, qty, price)
             if profit then
-                row.sale, row.profit = price * qty, profit
+                row.sale, row.profit, row.saleFrom = price * qty, profit, from
                 row.status = profit >= 0 and "profit" or "loss"
             else
                 row.status = "unknown"
@@ -935,13 +981,36 @@ function L.refDoc(db, at)
             return a[2] < b[2]
         end)
     end
+    -- The player's own sales and returns (M3), stored under the dedup key rather than in order. Sorted by
+    -- expiry then name, so the same mailbox always produces the same document.
+    local sales = {}
+    if type(db.sales) == "table" then
+        for _, s in pairs(db.sales) do
+            if type(s) == "table" and isCount(s[1], 0) and validName(s[2]) and isCount(s[3], 1)
+                and isCount(s[4], 0) and isCount(s[5], 0) and isCount(s[6], 0) and OUTCOMES[s[7]]
+                and isCount(s[8], 1) then
+                sales[#sales + 1] = { s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8] }
+            end
+        end
+        -- Expiry then name is the order the document promises; outcome, count and price break the rest of
+        -- the ties, because together with those two they ARE the dedup key - so no two rows can compare
+        -- equal, and pairs() order above can never reach the output.
+        table.sort(sales, function(a, b)
+            if a[8] ~= b[8] then return a[8] < b[8] end
+            if a[2] ~= b[2] then return a[2] < b[2] end
+            if a[7] ~= b[7] then return a[7] < b[7] end
+            if a[3] ~= b[3] then return a[3] < b[3] end
+            return a[4] < b[4]
+        end)
+    end
     local settings = cleanSettings(db.settings)
     local hasSettings = false
     for _ in pairs(settings) do
         hasSettings = true
         break
     end
-    if #vendor == 0 and #recipes == 0 and #variants == 0 and #items == 0 and #suffixes == 0 and not hasSettings then
+    if #vendor == 0 and #recipes == 0 and #variants == 0 and #items == 0 and #suffixes == 0
+        and #sales == 0 and not hasSettings then
         return nil
     end
     local doc = { schema = L.SCHEMA, kind = "ref", at = countOr0(at), addon = L.VERSION, vendor = vendor, recipes = recipes }
@@ -949,19 +1018,20 @@ function L.refDoc(db, at)
     if hasSettings then doc.settings = settings end
     if #items > 0 then doc.items = items end
     if #suffixes > 0 then doc.suffixes = suffixes end
+    if #sales > 0 then doc.sales = sales end
     return doc
 end
 
--- -> "r2:<b64>"   (its own tag: the scan extractor on the server only ever looks for "j1:" and "end:")
+-- -> "r3:<b64>"   (its own tag: the scan extractor on the server only ever looks for "j1:" and "end:")
 function L.refTag(b64)
-    return "r2:" .. tostring(b64)
+    return "r3:" .. tostring(b64)
 end
 
--- "r2:<b64>" -> b64 ; anything else -> nil. This client only ever writes r2 now (the server still reads an
--- r1 from an addon that has not updated, but Export.saveRef only ever checks its OWN tag right back).
+-- "r3:<b64>" -> b64 ; anything else -> nil. This client only ever writes r3 now (the server still reads an
+-- r1 or r2 from an addon that has not updated, but Export.saveRef only ever checks its OWN tag right back).
 function L.refOf(text)
     if type(text) ~= "string" then return nil end
-    return string.match(text, "^r2:([A-Za-z0-9+/=]+)$")
+    return string.match(text, "^r3:([A-Za-z0-9+/=]+)$")
 end
 
 -- Whole numbers from one id -> value table, copied. -> the copy, how many
@@ -1031,6 +1101,17 @@ function L.applyBaked(db, baked, now)
             end
         end
     end
+    -- M3: what the server worked out for this market - the market value per unit, and how many sell in a
+    -- day x100 (an integer, so the file carries no float). Unlike auction prices these are not "newest
+    -- wins": the game cannot compute either of them, so whatever the file says is all there is. A market
+    -- value of 0 is not a value; a sale rate of 0 is a real answer, and is kept.
+    -- PRESENT replaces, ABSENT keeps (fix round 2): an EMPTY table is present and means "this market has no
+    -- numbers yet", but a file built with no stats section at all - the local bake (src/tools/bake.ts) writes
+    -- none - knows nothing about this market and must not blank what the tray's last server-built file wrote.
+    -- A damaged value that is not a table is treated as absent for the same reason: keeping a stale figure
+    -- beats throwing away a good one over a corrupt file.
+    if type(baked.market) == "table" then db.market = cleanCounts(baked.market, 1) end
+    if type(baked.sells) == "table" then db.sells = cleanCounts(baked.sells, 0) end
     return vendorAdded, recipesAdded, adoptPrices(db, baked, now)
 end
 
