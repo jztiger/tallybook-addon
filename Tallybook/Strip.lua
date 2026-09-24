@@ -39,6 +39,9 @@
 -- buttons call ns.Scan, which is the one file that sends a request. Every widget is built under pcall,
 -- and a client that has no auction house window gets no strip and no scan of its own accord - the
 -- commands still work, and nothing the player cannot see ever starts.
+--
+-- Send (0.9.3) is a click; it is the only thing besides /tally reload that reloads the UI, and nothing
+-- reloads it without one.
 
 local _, ns = ...
 local Logic = ns.Logic
@@ -47,7 +50,7 @@ local Strip = {}
 ns.Strip = Strip
 
 local BUTTON_W, BUTTON_H = 60, 22
-local WIDTH, HEIGHT = 190, 76
+local WIDTH, HEIGHT = 250, 76 -- four buttons wide since 0.9.3 (Scan, Browse, Stop, Send)
 
 -- What is true of THIS opening of the auction house. Either one is enough to stop a second scan, and only
 -- AUCTION_HOUSE_CLOSED clears them - with one exception, in the two places marked "refused" below: a scan
@@ -100,6 +103,21 @@ local function newButton(parent, width, text, onClick)
     return button
 end
 
+-- A plain hover tooltip, the same GameTooltip:SetText/Show/Hide a plain-text tooltip anywhere else in the
+-- game uses. Guarded like everything else: a client missing any one piece of it just shows no tooltip.
+local function withTooltip(widget, text)
+    widget:SetScript("OnEnter", guarded(function(self)
+        if type(GameTooltip) ~= "table" or type(GameTooltip.SetText) ~= "function"
+            or type(GameTooltip_SetDefaultAnchor) ~= "function" then return end
+        GameTooltip_SetDefaultAnchor(GameTooltip, self)
+        GameTooltip:SetText(text)
+        GameTooltip:Show()
+    end))
+    widget:SetScript("OnLeave", guarded(function()
+        if type(GameTooltip) == "table" and type(GameTooltip.Hide) == "function" then GameTooltip:Hide() end
+    end))
+end
+
 ---------------------------------------------------------------------------------------------------
 -- The decision (C7 as revised): gathered here, taken in Logic.autoScanDecision, obeyed below
 ---------------------------------------------------------------------------------------------------
@@ -136,7 +154,10 @@ end
 ---------------------------------------------------------------------------------------------------
 
 -- Limit 5: one line that always says what is happening. A scan in progress wins over everything else;
--- otherwise the player is told why no scan started, or how old the prices they are looking at are.
+-- otherwise the player is told why no scan started, or how old the prices they are looking at are - with
+-- one suffix (0.9.3), appended to whatever the line would otherwise say: " - press Send to upload" while
+-- ns.pendingUpload is true (a scan or a newly learned recipe this session, nothing sent since). Not while
+-- a scan is running: there is nothing yet to send from THIS scan, and the busy line matters more.
 local function statusText(status)
     if status.busy then
         -- A browse run whose query the client has not taken yet: the single wait of limit 1, and the wait a
@@ -147,12 +168,22 @@ local function statusText(status)
         end
         return "scanning ..."
     end
+    local text
     local reason = decide(status)
-    if reason == "skip-off" then return "auto-scan is off" end
-    if reason == "skip-cooldown" then return "the house is busy - try the button in a moment" end
-    local newest = newestScanAt(status)
-    if newest <= 0 then return "no prices yet - press Browse" end
-    return "last scan " .. Logic.formatAge(ns.serverTime() - newest) .. " ago"
+    if reason == "skip-off" then
+        text = "auto-scan is off"
+    elseif reason == "skip-cooldown" then
+        text = "the house is busy - try the button in a moment"
+    else
+        local newest = newestScanAt(status)
+        if newest <= 0 then
+            text = "no prices yet - press Browse"
+        else
+            text = "last scan " .. Logic.formatAge(ns.serverTime() - newest) .. " ago"
+        end
+    end
+    if ns.pendingUpload then text = text .. " - press Send to upload" end
+    return text
 end
 
 local function paint()
@@ -193,12 +224,20 @@ local function build(parent)
         ns.Scan.stop()
         paint()
     end)
-    if not (frame.scanButton and frame.browseButton and frame.stopButton) then
+    -- 0.9.3: the only other click that reloads the UI, through the SAME ns.reload as /tally reload - see
+    -- the file header. Always shown, unlike Stop: sending is never tied to a scan being in progress.
+    frame.sendButton = newButton(frame, BUTTON_W, "Send", function()
+        ns.reload()
+        paint()
+    end)
+    if not (frame.scanButton and frame.browseButton and frame.stopButton and frame.sendButton) then
         error("this client could not build a button")
     end
+    withTooltip(frame.sendButton, "Send - reloads the UI")
     frame.scanButton:SetPoint("TOPLEFT", frame, "TOPLEFT", 0, 0)
     frame.browseButton:SetPoint("TOPLEFT", frame.scanButton, "TOPRIGHT", 2, 0)
     frame.stopButton:SetPoint("TOPLEFT", frame.browseButton, "TOPRIGHT", 2, 0)
+    frame.sendButton:SetPoint("TOPLEFT", frame.stopButton, "TOPRIGHT", 2, 0)
 
     -- The switch. A real tick box where the client has the template, else a button reading "[x] auto-scan";
     -- which one it is is remembered rather than guessed from the widget, because only one has a tick.
@@ -238,6 +277,7 @@ function Strip.attach()
     Strip.scanButton = built.scanButton
     Strip.browseButton = built.browseButton
     Strip.stopButton = built.stopButton
+    Strip.sendButton = built.sendButton
     Strip.autoBox = built.autoBox
     Strip.status = built.status
 end

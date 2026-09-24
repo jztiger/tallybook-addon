@@ -38,10 +38,12 @@ A small strip appears beside the auction house window:
 - One status line says what's happening: `waiting for the house to accept a query` while the scan waits for the
   client, `scanning ... page 3` while a scan runs, `last scan 6h ago` when the last one is old news, `the house
   is busy - try the button in a moment` if the game's own cooldown turned the query away even then (it isn't
-  tried again until you close and reopen the house), or `no prices yet - press Browse` the first time.
+  tried again until you close and reopen the house), or `no prices yet - press Browse` the first time. It adds
+  `- press Send to upload` whenever there is something new to send.
+- **Send** uploads what you have learned - it reloads the UI, which is what writes the file.
 
 Opening a profession window also reads its recipes, every time - nothing to type there either. A line beside the
-**Profit** button confirms it: `✓ learned 41 recipes, 3 new`.
+**Profit** button confirms it: `✓ learned 41 recipes, 3 new`, with its own **Send** button beside that line.
 
 Also available, as typed commands - the strip's first two buttons do the same things as the first two rows below:
 

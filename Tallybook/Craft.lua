@@ -80,18 +80,56 @@ end
 -- profession that had been open just before the one actually read. GetAllRecipeIDs already lists the new
 -- profession's recipes at the moment GetBaseProfessionInfo can still describe the old one for a moment
 -- longer, so a single read of the window at the top of learnRecipes can tag a whole profession wrong.
--- GetTradeSkillLineForRecipe(recipeID) -> tradeSkillID, skillLineName, parentTradeSkillID; only the first
--- two are read (the recipe's own profession and skill line, not the expansion-general parent). nil, nil
--- when the client has no such call, or answers nothing usable for this one recipe - the caller falls back
--- to the window itself (professionInfo above) for those.
+--
+-- 0.9.3, live finding: GetTradeSkillLineForRecipe's own tradeSkillID turned out to be FOREVER'S OWN
+-- internal id space (Leatherworking 2945, Cooking 2939, First Aid 2942, Fishing 2943, Skinning 2947,
+-- Tailoring 2948 - all seen live), not the classic profession id the window and the server both mean by
+-- skill_line (professionID 165 for Leatherworking, confirmed by the owner's live /dump). The two id
+-- spaces mixed in one column worked only because a name still told them apart on the pages; a row with no
+-- name would not survive it. So the NAME is always this call's own skillLineName once it has one; the ID
+-- is resolved through ONE precedence, stated here in full (flushPending below applies only its last two
+-- tiers, and points back to this comment rather than restating them):
+--   1. parentTradeSkillID - this call's own third return - when a positive integer: the cheapest correct
+--      answer, needing nothing further.
+--   2. else C_TradeSkillUI.GetProfessionInfoBySkillLineID(tradeSkillID): its parentProfessionID when a
+--      positive integer, else its professionID when a positive integer.
+--   3. else the WINDOW's professionID (professionInfo above, read once the whole read is done - 0.9.2)
+--      when a positive integer.
+--   4. else this call's own raw tradeSkillID - Forever's internal id, wrong space but still an id, and
+--      only ever reached when nothing else above answered anything at all.
+-- -> skillLineName, id, tradeSkillID. id is the FULLY resolved answer (tier 1 or 2) when non-nil, in
+-- which case the caller can file the recipe immediately; id nil means tiers 3-4 (the window, then
+-- tradeSkillID itself) decide once the read completes - skillLineName and tradeSkillID still ride along
+-- for that. Every value nil when the client has no GetTradeSkillLineForRecipe at all, or this one recipe
+-- answers nothing usable - tier 3 then supplies BOTH the name and the id, as it always has.
 local function recipeProfession(recipeID)
     local T = C_TradeSkillUI
-    if type(T) ~= "table" or type(T.GetTradeSkillLineForRecipe) ~= "function" then return nil, nil end
-    local ok, tradeSkillID, skillLineName = pcall(T.GetTradeSkillLineForRecipe, recipeID)
-    if not ok or ns.isSecret(tradeSkillID) or ns.isSecret(skillLineName) then return nil, nil end
-    if type(skillLineName) ~= "string" or skillLineName == "" then return nil, nil end
-    if type(tradeSkillID) ~= "number" or tradeSkillID < 1 or tradeSkillID % 1 ~= 0 then return nil, nil end
-    return skillLineName, tradeSkillID
+    if type(T) ~= "table" or type(T.GetTradeSkillLineForRecipe) ~= "function" then return nil, nil, nil end
+    local ok, tradeSkillID, skillLineName, parentTradeSkillID = pcall(T.GetTradeSkillLineForRecipe, recipeID)
+    if not ok or ns.isSecret(tradeSkillID) or ns.isSecret(skillLineName) then return nil, nil, nil end
+    if type(skillLineName) ~= "string" or skillLineName == "" then return nil, nil, nil end
+    if type(tradeSkillID) ~= "number" or tradeSkillID < 1 or tradeSkillID % 1 ~= 0 then return nil, nil, nil end
+    -- Tier 1.
+    if not ns.isSecret(parentTradeSkillID) and type(parentTradeSkillID) == "number"
+        and parentTradeSkillID > 0 and parentTradeSkillID % 1 == 0 then
+        return skillLineName, parentTradeSkillID, tradeSkillID
+    end
+    -- Tier 2.
+    if type(T.GetProfessionInfoBySkillLineID) == "function" then
+        local ok2, info = pcall(T.GetProfessionInfoBySkillLineID, tradeSkillID)
+        if ok2 and not ns.isSecret(info) and type(info) == "table" then
+            local parentID = info.parentProfessionID
+            if not ns.isSecret(parentID) and type(parentID) == "number" and parentID > 0 and parentID % 1 == 0 then
+                return skillLineName, parentID, tradeSkillID
+            end
+            local profID = info.professionID
+            if not ns.isSecret(profID) and type(profID) == "number" and profID > 0 and profID % 1 == 0 then
+                return skillLineName, profID, tradeSkillID
+            end
+        end
+    end
+    -- Neither tier resolved: id stays nil, tiers 3-4 decide at flush time.
+    return skillLineName, nil, tradeSkillID
 end
 
 -- Reads every recipe of the open profession, SLICE per frame. A recipe recipeProfession cannot place
@@ -112,18 +150,27 @@ function Craft.learnRecipes()
 
     local db = Logic.initDB(TallybookDB)
     local i, added = 0, 0
-    -- { outputItemID, recipeID, qty, mats, name, fresh }, one per recipe recipeProfession could not place.
+    -- { outputItemID, recipeID, qty, mats, name, fresh, profName, tradeSkillID }, one per recipe whose id
+    -- recipeProfession could not resolve on its own (tiers 1-2 in the comment above): profName and
+    -- tradeSkillID are whatever recipeProfession DID find - a name with no id yet, or nothing at all - and
+    -- ride along so flushPending can apply tiers 3-4 without losing a name it already had (0.9.3).
     local pending = {}
     reading = true
 
-    -- Files every still-pending recipe under the window's own profession, read now - see the function
-    -- comment above for why now and not at the start. Also the recovery path if step() throws partway
-    -- through: what was already read should not be lost just because it has no profession yet.
+    -- Files every still-pending recipe once the read is done: tiers 3 (the window's own professionID,
+    -- read now for the reason 0.9.2 gives above) then 4 (the entry's own tradeSkillID) of the precedence on
+    -- recipeProfession, applied only to the id - a recipe's own name (entry's profName) always wins over
+    -- the window's when recipeProfession already found one; only a recipe it told nothing about at all
+    -- uses the window's name too. Also the recovery path if step() throws partway through: what was
+    -- already read should not be lost just because its id was not settled yet.
     local function flushPending()
         if #pending == 0 then return end
-        local profName, skillLine = professionInfo()
+        local windowName, windowID = professionInfo()
         for p = 1, #pending do
             local entry = pending[p]
+            local profName = entry[7] or windowName
+            local skillLine = windowID
+            if skillLine <= 0 and type(entry[8]) == "number" and entry[8] > 0 then skillLine = entry[8] end
             if Logic.addRecipe(db.recipes, entry[1], entry[2], entry[3], entry[4], entry[5], profName, skillLine) then
                 added = added + entry[6]
             end
@@ -141,13 +188,13 @@ function Craft.learnRecipes()
                 local outputItemID, made, mats, name = readSchematic(schematic)
                 if outputItemID then
                     local fresh = countNew(db.recipes, outputItemID, recipeID)
-                    local profName, skillLine = recipeProfession(recipeID)
-                    if profName then
+                    local profName, skillLine, tradeSkillID = recipeProfession(recipeID)
+                    if profName and skillLine then
                         if Logic.addRecipe(db.recipes, outputItemID, recipeID, made, mats, name, profName, skillLine) then
                             added = added + fresh
                         end
                     else
-                        pending[#pending + 1] = { outputItemID, recipeID, made, mats, name, fresh }
+                        pending[#pending + 1] = { outputItemID, recipeID, made, mats, name, fresh, profName, tradeSkillID }
                     end
                 end
             end
@@ -160,6 +207,7 @@ function Craft.learnRecipes()
         reading = false
         ns.changed()
         if added > 0 then
+            ns.pendingUpload = true -- 0.9.3: something is now waiting on a Send / /tally reload to go out
             ns.print(string.format("learned %.0f recipes (%.0f new) - hover a craftable item to see its Crafting Cost", #ids, added))
         end
         -- M2: a small on-screen confirmation beside the Profit button, every run - not only when

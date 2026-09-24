@@ -163,6 +163,21 @@ local function setText(widget, text)
     if widget.label then widget.label:SetText(text) else widget:SetText(text) end
 end
 
+-- A plain hover tooltip - the same GameTooltip:SetText/Show/Hide a plain-text tooltip anywhere in the game
+-- uses. Guarded like everything else here: a client missing any one piece of it just shows no tooltip.
+local function withTooltip(widget, text)
+    widget:SetScript("OnEnter", guarded(function(self)
+        if type(GameTooltip) ~= "table" or type(GameTooltip.SetText) ~= "function"
+            or type(GameTooltip_SetDefaultAnchor) ~= "function" then return end
+        GameTooltip_SetDefaultAnchor(GameTooltip, self)
+        GameTooltip:SetText(text)
+        GameTooltip:Show()
+    end))
+    widget:SetScript("OnLeave", guarded(function()
+        if type(GameTooltip) == "table" and type(GameTooltip.Hide) == "function" then GameTooltip:Hide() end
+    end))
+end
+
 local function newLabel(parent, font, justify)
     local text = parent:CreateFontString(nil, "OVERLAY", font)
     text:SetJustifyH(justify or "LEFT")
@@ -435,9 +450,9 @@ function Summary.toggle()
 end
 
 -- The "Profit" button, once, as soon as the game has built its profession window. Safe to call again on
--- a later event: the button and the label under it are each built at most once, but independently - if
--- the label's pcall failed while the button's own succeeded, a later call tries the label again rather
--- than leaving it missing for the rest of the session.
+-- a later event: the button, the learned-text label under it, and the Send button beside that label are
+-- each built at most once, but independently - if one's pcall failed while an earlier one succeeded, a
+-- later call tries only the piece still missing rather than leaving it missing for the rest of the session.
 function Summary.attach()
     if cannotBuild or not window() then return end
     if not Summary.button then
@@ -460,8 +475,26 @@ function Summary.attach()
         local okLabel, label = pcall(newLabel, Summary.button, "GameFontHighlightSmall", "LEFT")
         if okLabel then
             label:SetPoint("TOPLEFT", Summary.button, "BOTTOMLEFT", 0, -4)
-            label:SetWidth(200)
+            label:SetWidth(320) -- room for the longest line: "learned 999 recipes, 999 new - press Send to upload"
             Summary.learnedText = label
+        end
+    end
+
+    -- 0.9.3: the same reload as /tally reload and the strip's own Send (Core.lua ns.reload) - beside the
+    -- learned line, the other place a friend is looking right after opening a profession window. Needs the
+    -- label to anchor to, so it waits for that, same as the label waits for the button.
+    if not Summary.sendButton and Summary.learnedText then
+        local okSend, send = pcall(CreateFrame, "Button", nil, window(), "UIPanelButtonTemplate")
+        if not okSend then
+            okSend, send = pcall(textButton, window(), 50, "CENTER", function() end)
+        end
+        if okSend then
+            send:SetSize(50, 20)
+            send:SetPoint("LEFT", Summary.learnedText, "RIGHT", 6, 0)
+            setText(send, "Send")
+            send:SetScript("OnClick", guarded(function() ns.reload() end))
+            withTooltip(send, "Send - reloads the UI")
+            Summary.sendButton = send
         end
     end
 end
@@ -472,7 +505,9 @@ end
 function Summary.setLearned(total, added)
     Summary.attach()
     if not Summary.learnedText then return end
-    Summary.learnedText:SetText(string.format("✓ learned %.0f recipes, %.0f new", total, added))
+    local text = string.format("✓ learned %.0f recipes, %.0f new", total, added)
+    if ns.pendingUpload then text = text .. " - press Send to upload" end -- 0.9.3
+    Summary.learnedText:SetText(text)
 end
 
 ns.onChange(Summary.refresh)

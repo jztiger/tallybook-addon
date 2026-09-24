@@ -276,6 +276,7 @@ local function finishReplicate(run, agg, n, unreadable, noLink)
     })
     ns.Export.save(doc)
     lastScanAt = t1 -- the market was read, complete or not: the strip counts it as this session's newest
+    ns.pendingUpload = true -- 0.9.3: something is now waiting on a Send / /tally reload to go out
 end
 
 local function processReplicate(run, n)
@@ -649,6 +650,7 @@ local function finishBrowse(run, complete, why)
     local doc = Logic.buildDoc(run.meta, "browse", complete, run.t0, t1, rows, { uid = run.uid, rowCount = #results })
     ns.Export.save(doc)
     lastScanAt = t1 -- the market was read, complete or not: the strip counts it as this session's newest
+    ns.pendingUpload = true -- 0.9.3: something is now waiting on a Send / /tally reload to go out
     -- M2: item names, quality and the full names of any suffixed keys, learned from this scan's own
     -- results only (Ruling A/B) - after the scan is safely saved, like the variant learning right below.
     noteBrowseNames(safe)
@@ -1055,4 +1057,5 @@ function Scan.selftest()
         suffixSeen = agg.suffixSeen,
     })
     ns.Export.save(doc)
+    ns.pendingUpload = true -- 0.9.3: something is now waiting on a Send / /tally reload to go out
 end

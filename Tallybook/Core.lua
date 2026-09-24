@@ -164,6 +164,13 @@ ns.ahOpen = false
 ns.on("AUCTION_HOUSE_SHOW", function() ns.ahOpen = true end)
 ns.on("AUCTION_HOUSE_CLOSED", function() ns.ahOpen = false end)
 
+-- 0.9.3: something this session has not gone into the saved file yet - a scan (Scan.lua's finishReplicate /
+-- finishBrowse / selftest) or a newly learned recipe (Craft.lua's learnRecipes, when it adds one). Read by
+-- Strip.lua and Summary.lua to nudge "press Send to upload"; cleared by ns.reload below, before the reload
+-- that is the only thing that ever writes it out. Not saved: like everything else session-only, it starts
+-- false every time the client loads.
+ns.pendingUpload = false
+
 ---------------------------------------------------------------------------------------------------
 -- What labels a scan
 ---------------------------------------------------------------------------------------------------
@@ -240,8 +247,11 @@ function commands.list(arg)
     ns.print("recipe list shows: " .. ns.settings().list .. "   (/tally list profit | /tally list cost)")
 end
 
--- The only place in the addon that reloads the UI, and only because the player typed it.
-function commands.reload()
+-- The only place in the addon that reloads the UI, and only because the player asked - by typing
+-- /tally reload, or by clicking a Send button (Strip.lua, Summary.lua): both call this SAME function
+-- (commands.reload below is a plain alias, not a second body), so there is still exactly one ReloadUI()
+-- call site in the whole addon, wherever it was asked for from (0.9.3).
+function ns.reload()
     if ns.Scan.busy() then
         ns.print("a scan is still running. Wait for it to finish, or type /reload yourself to abandon it.")
         return
@@ -250,9 +260,11 @@ function commands.reload()
         ns.print("this client has no reload function. Type /reload instead.")
         return
     end
+    ns.pendingUpload = false -- before beforeWrite/ReloadUI, not after: ReloadUI need not ever return
     ns.beforeWrite()
     ReloadUI()
 end
+commands.reload = ns.reload
 
 SLASH_TALLYBOOK1 = "/tally"
 SLASH_TALLYBOOK2 = "/tallybook"
