@@ -56,10 +56,12 @@ local function countNew(book, outputItemID, recipeID)
     return 1
 end
 
--- The open profession's name and its numeric skill line (M2): C_TradeSkillUI.GetBaseProfessionInfo() is
--- already used the same way in Summary.lua:80. professionID is the TradeSkillLineID (Tailoring = 197,
--- what recipe.skill_line means server-side) - a different number from the small `profession` enum field
--- on the same table, which this does not read. Guarded like every other client API here; 0 means unknown.
+-- The open profession's name and its numeric skill line (M2), the FALLBACK for a recipe recipeProfession
+-- below cannot place: C_TradeSkillUI.GetBaseProfessionInfo() is already used the same way in
+-- Summary.lua:80. professionID is the TradeSkillLineID (Tailoring = 197, what recipe.skill_line means
+-- server-side) - a different number from the small `profession` enum field on the same table, which this
+-- does not read (0.9.2, confirmed against the live client). Guarded like every other client API here; 0
+-- means unknown.
 local function professionInfo()
     local T = C_TradeSkillUI
     if type(T) ~= "table" or type(T.GetBaseProfessionInfo) ~= "function" then return nil, 0 end
@@ -72,7 +74,31 @@ local function professionInfo()
     return name, id
 end
 
--- Reads every recipe of the open profession, SLICE per frame.
+-- 0.9.2, live defect: a recipe's OWN trade skill line, when the client can say one, wins over whatever
+-- profession window happens to be open. Found in game: 604 Leatherworking recipes filed as "Skinning"
+-- (skill line 393) and 32 Cooking recipes as "Fishing" (356) - in both pairs the FIRST name is the
+-- profession that had been open just before the one actually read. GetAllRecipeIDs already lists the new
+-- profession's recipes at the moment GetBaseProfessionInfo can still describe the old one for a moment
+-- longer, so a single read of the window at the top of learnRecipes can tag a whole profession wrong.
+-- GetTradeSkillLineForRecipe(recipeID) -> tradeSkillID, skillLineName, parentTradeSkillID; only the first
+-- two are read (the recipe's own profession and skill line, not the expansion-general parent). nil, nil
+-- when the client has no such call, or answers nothing usable for this one recipe - the caller falls back
+-- to the window itself (professionInfo above) for those.
+local function recipeProfession(recipeID)
+    local T = C_TradeSkillUI
+    if type(T) ~= "table" or type(T.GetTradeSkillLineForRecipe) ~= "function" then return nil, nil end
+    local ok, tradeSkillID, skillLineName = pcall(T.GetTradeSkillLineForRecipe, recipeID)
+    if not ok or ns.isSecret(tradeSkillID) or ns.isSecret(skillLineName) then return nil, nil end
+    if type(skillLineName) ~= "string" or skillLineName == "" then return nil, nil end
+    if type(tradeSkillID) ~= "number" or tradeSkillID < 1 or tradeSkillID % 1 ~= 0 then return nil, nil end
+    return skillLineName, tradeSkillID
+end
+
+-- Reads every recipe of the open profession, SLICE per frame. A recipe recipeProfession cannot place
+-- waits in `pending` for the window's own answer - read once, after the LAST schematic rather than before
+-- the first (0.9.2, the live defect above): by the time every recipe has been read, the window can only
+-- describe the profession that is actually open, whatever it still said when the read began. Every
+-- pending recipe of this run gets that one end-of-read answer.
 function Craft.learnRecipes()
     local T = C_TradeSkillUI
     if reading or type(T) ~= "table" or type(T.GetAllRecipeIDs) ~= "function"
@@ -85,9 +111,26 @@ function Craft.learnRecipes()
     if not okIDs or type(ids) ~= "table" or #ids == 0 then return end
 
     local db = Logic.initDB(TallybookDB)
-    local profName, skillLine = professionInfo() -- once per run, not per recipe
     local i, added = 0, 0
+    -- { outputItemID, recipeID, qty, mats, name, fresh }, one per recipe recipeProfession could not place.
+    local pending = {}
     reading = true
+
+    -- Files every still-pending recipe under the window's own profession, read now - see the function
+    -- comment above for why now and not at the start. Also the recovery path if step() throws partway
+    -- through: what was already read should not be lost just because it has no profession yet.
+    local function flushPending()
+        if #pending == 0 then return end
+        local profName, skillLine = professionInfo()
+        for p = 1, #pending do
+            local entry = pending[p]
+            if Logic.addRecipe(db.recipes, entry[1], entry[2], entry[3], entry[4], entry[5], profName, skillLine) then
+                added = added + entry[6]
+            end
+        end
+        pending = {}
+    end
+
     local function step()
         local stop = math.min(i + SLICE, #ids)
         while i < stop do
@@ -98,8 +141,13 @@ function Craft.learnRecipes()
                 local outputItemID, made, mats, name = readSchematic(schematic)
                 if outputItemID then
                     local fresh = countNew(db.recipes, outputItemID, recipeID)
-                    if Logic.addRecipe(db.recipes, outputItemID, recipeID, made, mats, name, profName, skillLine) then
-                        added = added + fresh
+                    local profName, skillLine = recipeProfession(recipeID)
+                    if profName then
+                        if Logic.addRecipe(db.recipes, outputItemID, recipeID, made, mats, name, profName, skillLine) then
+                            added = added + fresh
+                        end
+                    else
+                        pending[#pending + 1] = { outputItemID, recipeID, made, mats, name, fresh }
                     end
                 end
             end
@@ -108,6 +156,7 @@ function Craft.learnRecipes()
             C_Timer.After(0, step)
             return
         end
+        flushPending()
         reading = false
         ns.changed()
         if added > 0 then
@@ -120,6 +169,7 @@ function Craft.learnRecipes()
     local ok, err = pcall(step)
     if not ok then
         reading = false
+        flushPending()
         ns.fail("recipes", err)
     end
 end
