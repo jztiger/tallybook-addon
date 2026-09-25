@@ -14,7 +14,7 @@
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Product>Tallybook</Product>
     <Description>Sends the Tallybook addon's saved file to your group's server and brings the data file back. Reads and writes nothing else.</Description>
   </PropertyGroup>

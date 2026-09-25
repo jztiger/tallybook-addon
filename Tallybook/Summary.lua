@@ -19,11 +19,13 @@ local WHEEL = 3               -- rows per notch of the mouse wheel
 local CRAFTS = { 1, 5, 10, 20, 50, 100 } -- what the "crafts" button cycles through, for a right-click basket
 -- columns: sort key, header text, left edge, width, alignment, the row's field for it
 local COLUMNS = {
-    { "name", "Recipe", 12, 190, "LEFT", "name" },
-    { "cost", "Cost", 206, 84, "RIGHT", "cost" },
-    { "sale", "Sells for", 294, 84, "RIGHT", "sale" },
-    { "listed", "Listed", 382, 56, "RIGHT", "listed" },
-    { "profit", "Profit / Loss", 442, 124, "RIGHT", "result" },
+-- 0.11.0: the Tally 2.0 words (Craft cost was Cost, Market value was Sells for, Profit was Profit / Loss), and
+-- the market value column wider for its "(lowest now)" fallback mark; the other columns give it the room.
+    { "name", "Recipe", 12, 170, "LEFT", "name" },
+    { "cost", "Craft cost", 186, 84, "RIGHT", "cost" },
+    { "sale", "Market value", 274, 124, "RIGHT", "sale" },
+    { "listed", "Listed", 402, 48, "RIGHT", "listed" },
+    { "profit", "Profit", 454, 112, "RIGHT", "result" },
 }
 local WIDTH = 578
 -- The profession tabs hang off the window's right edge (about 45 wide on this client): the panel starts past them.
@@ -142,11 +144,11 @@ local function costText(row)
 end
 
 -- M3: what the craft sells for. The server's market value where there is one; today's cheapest listing
--- otherwise, marked "(now)" so a figure that is only what somebody happens to be asking today never reads
+-- otherwise, marked "(lowest now)" so a figure that is only what somebody happens to be asking today never reads
 -- as what the item is worth.
 local function saleText(row)
     if not row.sale then return "-" end
-    return ns.UI.money(row.sale) .. (row.saleFrom == "now" and " (now)" or "")
+    return ns.UI.money(row.sale) .. (row.saleFrom == "now" and " (lowest now)" or "")
 end
 
 local function resultText(row)
@@ -458,7 +460,7 @@ function Summary.toggle()
 end
 
 -- The "Profit" button, once, as soon as the game has built its profession window. Safe to call again on
--- a later event: the button, the learned-text label under it, and the Send button beside that label are
+-- a later event: the button, the learned-text label under it, and the Sync button beside that label are
 -- each built at most once, but independently - if one's pcall failed while an earlier one succeeded, a
 -- later call tries only the piece still missing rather than leaving it missing for the rest of the session.
 function Summary.attach()
@@ -483,12 +485,12 @@ function Summary.attach()
         local okLabel, label = pcall(newLabel, Summary.button, "GameFontHighlightSmall", "LEFT")
         if okLabel then
             label:SetPoint("TOPLEFT", Summary.button, "BOTTOMLEFT", 0, -4)
-            label:SetWidth(320) -- room for the longest line: "learned 999 recipes, 999 new - press Send to upload"
+            label:SetWidth(320) -- room for the longest line: "learned 999 recipes, 999 new - press Sync to upload"
             Summary.learnedText = label
         end
     end
 
-    -- 0.9.3: the same reload as /tally reload and the strip's own Send (Core.lua ns.reload) - beside the
+    -- 0.9.3: the same reload as /tally reload and the strip's own Sync (Core.lua ns.reload) - beside the
     -- learned line, the other place a friend is looking right after opening a profession window. Needs the
     -- label to anchor to, so it waits for that, same as the label waits for the button.
     if not Summary.sendButton and Summary.learnedText then
@@ -499,9 +501,9 @@ function Summary.attach()
         if okSend then
             send:SetSize(50, 20)
             send:SetPoint("LEFT", Summary.learnedText, "RIGHT", 6, 0)
-            setText(send, "Send")
+            setText(send, "Sync")
             send:SetScript("OnClick", guarded(function() ns.reload() end))
-            withTooltip(send, "Send - reloads the UI")
+            withTooltip(send, "Sync - reloads the UI")
             Summary.sendButton = send
         end
     end
@@ -514,7 +516,7 @@ function Summary.setLearned(total, added)
     Summary.attach()
     if not Summary.learnedText then return end
     local text = string.format("✓ learned %.0f recipes, %.0f new", total, added)
-    if ns.pendingUpload then text = text .. " - press Send to upload" end -- 0.9.3
+    if ns.pendingUpload then text = text .. " - press Sync to upload" end -- 0.9.3; Sync was Send until 0.11.0
     Summary.learnedText:SetText(text)
 end
 

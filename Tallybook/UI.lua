@@ -1,13 +1,16 @@
 -- Tallybook: what the player sees on item tooltips, and the /tally status lines.
 --
---   Min AH Price: 45s (7m)                                  cheapest listing, from the last browse scan
---   Market: 52s · sells ~3.2/day                            what the server worked out, from Data.lua (M3)
+--   Lowest now: 45s (7m)                                    cheapest listing, from the last quick scan
+--   Market value: 52s · sells ~3.2 a day                   what the server worked out, from Data.lua (M3)
 --   Vendor: 10c                                             when a visited vendor sells it
---   Crafting Cost: 4s 90c                  Profit: 37s 85c  green, or "Loss: ..." in red: crafting to sell at the
---     4 x Medium Leather @ 1s 20c                   4s 80c  Min AH Price, less the auction house's cut. Left out
---     1 x Coarse Thread (vendor)                       10c  when it would be a guess (Logic.craftingProfit).
+--   Craft cost: 4s 90c                     Profit: 37s 85c  green, or "Profit: -..." in red: crafting to sell at
+--     4 x Medium Leather @ 1s 20c                   4s 80c  market value (else Lowest now), less the house's cut.
+--     1 x Coarse Thread (vendor)                       10c  Left out when a guess (Logic.craftingProfit).
 --
--- Crafting Cost = the mats of the cheapest known recipe, each at its vendor price when a vendor the player has
+-- 0.11.0: the Tally 2.0 words (docs/tally-2.0/README.md) - Lowest now was Min AH Price, Market value was
+-- Market, Craft cost was Crafting Cost, and a loss is a red Profit with a minus sign rather than "Loss".
+--
+-- Craft cost = the mats of the cheapest known recipe, each at its vendor price when a vendor the player has
 -- visited sells it, otherwise its auction price (last browse scan), times the quantity (Logic.cheapestRecipe).
 -- Recipes and vendor prices are learned by Craft.lua from windows the player opened.
 --
@@ -21,11 +24,11 @@ local Logic = ns.Logic
 local UI = {}
 ns.UI = UI
 
-local LABEL = "|cff33ff99Min AH Price|r: "
-local CRAFT_LABEL = "|cff33ff99Crafting Cost|r: "
+local LABEL = "|cff33ff99Lowest now|r: "
+local CRAFT_LABEL = "|cff33ff99Craft cost|r: "
 local VENDOR_LABEL = "|cff33ff99Vendor|r: "
-local MARKET_LABEL = "|cff33ff99Market|r: "
-local PROFIT, LOSS, DIM, CLOSE = "|cff00ff00Profit: ", "|cffff2020Loss: ", "|cff808080", "|r"
+local MARKET_LABEL = "|cff33ff99Market value|r: "
+local PROFIT, LOSS, DIM, CLOSE = "|cff00ff00Profit: ", "|cffff2020Profit: -", "|cff808080", "|r"
 
 ---------------------------------------------------------------------------------------------------
 -- Money
@@ -75,9 +78,17 @@ function UI.priceLine(itemID)
     return line, UI.marketLine(itemID)
 end
 
--- -> "Market: <value> · sells ~N.N/day", the two figures the server works out and sends back in Data.lua
--- (spec 2026-09-24 section 5). The sale rate travels x100 as a whole number, so it is divided here; it is
--- left off entirely when the server has none, and 0.0/day is a real answer rather than a missing one.
+-- -> "Market value: <value> · sells ~N a day", the two figures the server works out and sends back in
+-- Data.lua (spec 2026-09-24 section 5). The sale rate travels x100 as a whole number, so it is divided here;
+-- it is left off entirely when the server has none, and 0.0 a day is a real answer rather than a missing one.
+-- 0.11.0: at 100 a day and more it is a whole number, below that one decimal - the site's perDay rule
+-- (src/dashboard/money.ts), compared on the one-decimal text so 99.96 reads "100", never "100.0".
+local function perDay(rate)
+    local oneDecimal = string.format("%.1f", rate)
+    if tonumber(oneDecimal) >= 100 then return string.format("%.0f", math.floor(rate + 0.5)) end
+    return oneDecimal
+end
+
 function UI.marketLine(itemID)
     if ns.isSecret(itemID) or type(itemID) ~= "number" then return nil end
     local db = TallybookDB
@@ -87,13 +98,13 @@ function UI.marketLine(itemID)
     local line = MARKET_LABEL .. money(value)
     local sells = type(db.sells) == "table" and db.sells[itemID] or nil
     if type(sells) == "number" and sells >= 0 then
-        line = line .. " · sells ~" .. string.format("%.1f", sells / 100) .. "/day"
+        line = line .. " · sells ~" .. perDay(sells / 100) .. " a day"
     end
     return line
 end
 
 -- -> "Vendor: <unit price>" for an item a visited vendor sells for gold in unlimited supply, else nil.
--- This is the price Crafting Cost uses for that mat, whatever the auction house says.
+-- This is the price Craft cost uses for that mat, whatever the auction house says.
 function UI.vendorLine(itemID)
     if ns.isSecret(itemID) or type(itemID) ~= "number" then return nil end
     local db = TallybookDB
@@ -119,7 +130,7 @@ local function itemName(itemID)
 end
 UI.itemName = itemName
 
--- -> "Crafting Cost: <total> (<one> each) + N mats with no price", then "Profit: <n>" / "Loss: <n>" or nil, then
+-- -> "Craft cost: <total> (<one> each) + N mats with no price", then "Profit: <n>" / "Profit: -<n>" or nil, then
 -- the chosen recipe's mats as { {left, right}, ... }; nil when no recipe makes this item
 function UI.craftLine(itemID)
     if ns.isSecret(itemID) or type(itemID) ~= "number" then return nil end
@@ -236,7 +247,7 @@ function UI.status()
         .. (ns.Scan.busy() and ", a scan is running" or ""))
     ns.print("last full scan: " .. age(db.state.lastReplicateAt, now)
         .. (allowed and ", ready" or (", cooldown " .. Logic.formatAge(remaining) .. " left")))
-    ns.print("last browse scan: " .. age(db.state.lastBrowseAt, now))
+    ns.print("last quick scan: " .. age(db.state.lastBrowseAt, now))
     ns.print(string.format("held in memory: %.0f %s (room for %.0f), %.1f KB of %.0f MB - /tally reload writes them to disk",
         scans, scans == 1 and "scan" or "scans", Logic.RING_MAX_SCANS, bytes / 1024, Logic.RING_MAX_BYTES / 1048576))
 

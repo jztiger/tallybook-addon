@@ -9,6 +9,8 @@ namespace Tallybook.Tray.Tests
 {
     public class GameFoldersTests
     {
+        private static readonly string[] Beta = { "_classic_beta_" };
+
         private static string Touch(string root, params string[] parts)
         {
             string path = Path.Combine(new[] { root }.Concat(parts).ToArray());
@@ -23,8 +25,8 @@ namespace Tallybook.Tray.Tests
             using var dir = new TempDir();
             string a = Touch(dir.Path, "_classic_beta_", "WTF", "Account", "ACCT#1", "SavedVariables", "Tallybook.lua");
             string b = Touch(dir.Path, "_classic_beta_", "WTF", "Account", "ACCT#1", "SavedVariables", "Tallybook.lua.bak");
-            string c = Touch(dir.Path, "_retail_", "WTF", "Account", "OTHER", "SavedVariables", "Tallybook.lua");
-            // None of these may be picked up:
+            // None of these may be picked up - retail's is not Forever's, and only listed products are looked in:
+            Touch(dir.Path, "_retail_", "WTF", "Account", "OTHER", "SavedVariables", "Tallybook.lua");
             Touch(dir.Path, "_classic_beta_", "WTF", "Account", "ACCT#1", "SavedVariables", "Auctionator.lua");
             Touch(dir.Path, "_classic_beta_", "WTF", "Account", "ACCT#1", "Server", "Char", "SavedVariables", "Tallybook.lua");
             Touch(dir.Path, "_classic_beta_", "WTF", "Tallybook.lua");
@@ -32,8 +34,8 @@ namespace Tallybook.Tray.Tests
             Touch(dir.Path, "notagame", "WTF", "Account", "ACCT#1", "SavedVariables", "Tallybook.lua");
             Touch(dir.Path, "_classic_beta_", "_nested_", "WTF", "Account", "X", "SavedVariables", "Tallybook.lua");
 
-            var found = GameFolders.SavedFiles(dir.Path).OrderBy(p => p, StringComparer.Ordinal).ToArray();
-            Assert.Equal(new[] { a, b, c }.OrderBy(p => p, StringComparer.Ordinal).ToArray(), found);
+            var found = GameFolders.SavedFiles(dir.Path, Beta).OrderBy(p => p, StringComparer.Ordinal).ToArray();
+            Assert.Equal(new[] { a, b }.OrderBy(p => p, StringComparer.Ordinal).ToArray(), found);
         }
 
         [Fact]
@@ -45,7 +47,7 @@ namespace Tallybook.Tray.Tests
             Touch(dir.Path, "_classic_beta_", "Interface", "AddOns", "OtherAddon", "Data.lua");
             Touch(dir.Path, "_classic_beta_", "Interface", "AddOns", "Tallybook", "Sub", "Data.lua");
 
-            Assert.Equal(new[] { a }, GameFolders.DataFiles(dir.Path).ToArray());
+            Assert.Equal(new[] { a }, GameFolders.DataFiles(dir.Path, Beta).ToArray());
         }
 
         [Fact]
@@ -53,9 +55,9 @@ namespace Tallybook.Tray.Tests
         {
             using var dir = new TempDir();
             string missing = Path.Combine(dir.Path, "nope");
-            Assert.Empty(GameFolders.SavedFiles(missing));
-            Assert.Empty(GameFolders.DataFiles(missing));
-            Assert.Empty(GameFolders.SavedFiles(""));
+            Assert.Empty(GameFolders.SavedFiles(missing, Beta));
+            Assert.Empty(GameFolders.DataFiles(missing, Beta));
+            Assert.Empty(GameFolders.SavedFiles("", Beta));
             Assert.False(GameFolders.LooksLikeWow(missing));
             Assert.False(GameFolders.LooksLikeWow(dir.Path));
             Assert.False(Directory.Exists(missing));

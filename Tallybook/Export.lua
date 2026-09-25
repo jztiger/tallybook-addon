@@ -99,7 +99,7 @@ function Export.save(doc)
         base64Ms = t2 - t1,
     }
     ns.print(string.format("saved %s scan: %.0f rows, %.1f KB, json %.0f ms, base64 %.0f ms — /tally reload to write it to disk",
-        tostring(doc.kind), stats.rows, stats.bytes / 1024, stats.jsonMs, stats.base64Ms))
+        Logic.scanWord(doc.kind), stats.rows, stats.bytes / 1024, stats.jsonMs, stats.base64Ms))
     if lost > 0 then
         ns.print(string.format("no room left: dropped %.0f %s that had never been written to disk%s."
             .. " /tally reload before scanning again.", lost, lost == 1 and "scan" or "scans",

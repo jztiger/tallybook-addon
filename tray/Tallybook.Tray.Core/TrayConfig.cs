@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+
 namespace Tallybook.Tray
 {
     /// <summary>Everything the tray app is told or asked. The three credentials come from the member's own download.</summary>
@@ -20,6 +22,11 @@ namespace Tallybook.Tray
         /// <summary>Which version of the notice they accepted. 0 means they have not seen one.</summary>
         public int AcceptedNoticeVersion { get; set; }
         public bool Paused { get; set; }
+        /// <summary>
+        /// Forever's product folders: the last list the server sent, so this works offline too. Replaced whole,
+        /// never changed in place - a pass reads it on another thread.
+        /// </summary>
+        public IReadOnlyList<string> Products { get; set; } = ForeverProducts.Default;
 
         /// <summary>Safe to log: no credential, no folder.</summary>
         public override string ToString() =>

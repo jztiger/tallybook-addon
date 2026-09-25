@@ -4,7 +4,7 @@
 --   * a profession window -> each recipe's output item, how many it makes, and its required mats
 --   * a vendor window     -> the unit price of everything sold for plain gold in unlimited supply
 -- What is learned lands in TallybookDB.recipes / TallybookDB.vendor; UI.lua turns it into the
--- "Crafting Cost" tooltip line with Logic.cheapestRecipe. Nothing here touches the auction house.
+-- "Craft cost" tooltip line with Logic.cheapestRecipe. Nothing here touches the auction house.
 
 local ADDON, ns = ...
 local Logic = ns.Logic
@@ -207,8 +207,8 @@ function Craft.learnRecipes()
         reading = false
         ns.changed()
         if added > 0 then
-            ns.pendingUpload = true -- 0.9.3: something is now waiting on a Send / /tally reload to go out
-            ns.print(string.format("learned %.0f recipes (%.0f new) - hover a craftable item to see its Crafting Cost", #ids, added))
+            ns.pendingUpload = true -- 0.9.3: something is now waiting on a Sync / /tally reload to go out
+            ns.print(string.format("learned %.0f recipes (%.0f new) - hover a craftable item to see its Craft cost", #ids, added))
         end
         -- M2: a small on-screen confirmation beside the Profit button, every run - not only when
         -- something is new, so reopening an already-known profession still confirms it worked.
@@ -297,7 +297,8 @@ function Craft.basket(crafts, chosen)
         local price = type(db.prices) == "table" and db.prices[chosen.itemID] or nil
         local profit = Logic.craftingProfit(b.perCraft, 0, recipe.qty, price)
         if profit then
-            ns.print("sells for " .. money(price) .. ": " .. money(math.abs(profit)) .. (profit >= 0 and " profit" or " LOSS") .. " each")
+            -- 0.11.0: the Tally 2.0 words - the price is Lowest now, and a loss is a negative Profit.
+            ns.print("lowest now " .. money(price) .. ": profit " .. (profit >= 0 and "" or "-") .. money(math.abs(profit)) .. " each")
         end
     end
 

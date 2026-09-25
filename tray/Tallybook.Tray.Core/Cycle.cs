@@ -27,6 +27,8 @@ namespace Tallybook.Tray
         public int Wrote { get; set; }
         /// <summary>The addon version installed this pass, or null when nothing was installed.</summary>
         public string? AddonInstalled { get; set; }
+        /// <summary>The server sent a different list of product folders; it is in the config now, to be saved.</summary>
+        public bool ProductsChanged { get; set; }
         public TrayState State { get; set; } = TrayState.Ok;
         /// <summary>Plain words for the tooltip when the state is not Ok.</summary>
         public string Reason { get; set; } = "";
@@ -132,16 +134,14 @@ namespace Tallybook.Tray
                 }
             }
 
-            // Before the data file, so a fresh install's empty Data.lua is filled in this same pass.
-            if (config.KeepAddonUpToDate)
+            // Before the data file, so a fresh install's empty Data.lua is filled in this same pass. Also when updates
+            // are switched off: the manifest is where the product folders come from (nothing is installed then).
+            string? stop = await KeepAddonCurrent(report, now, force).ConfigureAwait(false);
+            if (stop != null)
             {
-                string? stop = await KeepAddonCurrent(report, now, force).ConfigureAwait(false);
-                if (stop != null)
-                {
-                    refused = true;
-                    log.Write("refused: " + stop + " - stopped until asked again");
-                    return Done(report, TrayState.NeedsAttention, "The server refused this PC's credentials");
-                }
+                refused = true;
+                log.Write("refused: " + stop + " - stopped until asked again");
+                return Done(report, TrayState.NeedsAttention, "The server refused this PC's credentials");
             }
 
             bool due = LastFetchUtc == null || now - LastFetchUtc.Value >= FetchEvery;
@@ -174,36 +174,27 @@ namespace Tallybook.Tray
         }
 
         /// <summary>
-        /// Installs the addon when it is missing and replaces it when a newer version is published. Returns null
-        /// normally, or the reason when the server refused this PC - anything else is logged and let go, because a
-        /// server with no addon to offer must not stop the uploads.
+        /// Learns the product folders from the manifest, and - when that is switched on - installs the addon when it
+        /// is missing and replaces it when a newer version is published. Returns null normally, or the reason when
+        /// the server refused this PC - anything else is logged and let go, because a server with no addon to offer
+        /// must not stop the uploads.
         /// </summary>
         private async Task<string?> KeepAddonCurrent(CycleReport report, DateTime now, bool force)
         {
+            bool install = config.KeepAddonUpToDate;
             // Where it already is - those get replaced. Only when it is nowhere does a first install pick a folder,
             // and then never on a guess: a Forever addon does not belong in somebody's retail game.
-            IReadOnlyList<string> folders = GameFolders.AddonFolders(config.WowFolder);
+            IReadOnlyList<string> folders = GameFolders.AddonFolders(config.WowFolder, config.Products);
             bool missing = folders.Count == 0;
-            if (missing)
-            {
-                string? fresh = GameFolders.InstallTarget(config.WowFolder);
-                if (fresh == null)
-                {
-                    if (!addonUnsure)
-                    {
-                        addonUnsure = true;
-                        log.Write("the addon is not installed and there is more than one game here - install it once yourself");
-                    }
-                    return null;
-                }
-                folders = new[] { fresh };
-            }
+            bool canPlace = !missing || GameFolders.InstallTarget(config.WowFolder, config.Products) != null;
             bool due = force || addonCheckedUtc == null || now - addonCheckedUtc.Value >= AddonEvery;
-            if (!missing && !due) return null;
+            // A missing addon with somewhere to go is fetched at once. Everything else waits for the cadence - also a
+            // PC where none of the listed folders is there, which asks only to learn whether the list has changed.
+            if (!due && !(install && missing && canPlace)) return null;
 
             // A missing addon has to be fetched whole, whatever our etag says about the last one we saw.
             (FetchResult result, AddonManifest? manifest, string? tag) =
-                await client.FetchAddonAsync(missing ? null : addonEtag).ConfigureAwait(false);
+                await client.FetchAddonAsync(install && missing && canPlace ? null : addonEtag).ConfigureAwait(false);
             addonCheckedUtc = now;
             if (result == FetchResult.Refused) return client.LastError;
             if (result == FetchResult.NotModified) return null;
@@ -212,7 +203,35 @@ namespace Tallybook.Tray
                 log.Write("no addon to install this time: " + client.LastError);
                 return null;
             }
+
+            IReadOnlyList<string> products = ForeverProducts.Choose(config.Products, manifest.Products);
+            if (!ForeverProducts.Same(products, config.Products))
+            {
+                config.Products = products;
+                report.ProductsChanged = true;
+                addonUnsure = false;
+                log.Write("the game's folders are now " + string.Join(", ", products)); // checked names: safe to log
+            }
+            // An etag stands for "acted on": with installing switched off, the next manifest must still be read whole
+            // once it is switched back on.
+            if (!install) return null;
             addonEtag = tag;
+
+            folders = GameFolders.AddonFolders(config.WowFolder, config.Products);
+            if (folders.Count == 0)
+            {
+                string? fresh = GameFolders.InstallTarget(config.WowFolder, config.Products);
+                if (fresh == null)
+                {
+                    if (!addonUnsure)
+                    {
+                        addonUnsure = true;
+                        log.Write("the addon is not installed and none of the game's folders (" + string.Join(", ", config.Products) + ") is here - install it once yourself");
+                    }
+                    return null;
+                }
+                folders = new[] { fresh };
+            }
 
             foreach (string folder in folders)
             {
@@ -233,7 +252,7 @@ namespace Tallybook.Tray
         private IEnumerable<FileInfo> QuietSavedFiles(DateTime now)
         {
             var quiet = new List<FileInfo>();
-            foreach (string path in GameFolders.SavedFiles(config.WowFolder))
+            foreach (string path in GameFolders.SavedFiles(config.WowFolder, config.Products))
             {
                 try
                 {
@@ -260,7 +279,7 @@ namespace Tallybook.Tray
         private bool PutInPlace(byte[] lua, CycleReport report)
         {
             bool ok = true;
-            foreach (string path in GameFolders.DataFiles(config.WowFolder))
+            foreach (string path in GameFolders.DataFiles(config.WowFolder, config.Products))
             {
                 try
                 {

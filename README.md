@@ -2,9 +2,9 @@
 
 A small, read-only auction house notebook for the World of Warcraft: Forever beta.
 
-- **Min AH Price** on item tooltips, from your own last price scan.
-- **Crafting Cost** for anything you can craft: every mat with its price (vendor price when a vendor sells it), and the
-  **Profit** or **Loss** of crafting it to sell, after the auction house's 5% cut.
+- **Lowest now** on item tooltips, from your own last price scan.
+- **Craft cost** for anything you can craft: every mat with its price (vendor price when a vendor sells it), and the
+  **Profit** (or a red **Profit** with a minus sign) of crafting it to sell, after the auction house's 5% cut.
 - The cost next to every recipe in the profession window, and a **Profit** panel (`/tally profit`) that lists a whole
   profession sorted by profit.
 
@@ -21,15 +21,16 @@ A small, read-only auction house notebook for the World of Warcraft: Forever bet
 
 Copy the `Tallybook` folder into `World of Warcraft\_classic_beta_\Interface\AddOns\`, start the game, and type `/tally`.
 
-Open the auction house and Tallybook scans it once, by itself (or press **Scan** for a full snapshot); open a
+Open the auction house and Tallybook scans it once, by itself (or press **Full scan** for a full snapshot); open a
 profession window and it learns your recipes. Nothing to type either way.
 
 A small strip appears beside the auction house window:
 
-- **Scan** runs a full market snapshot; **Browse** runs a quicker price scan - the same two scans the commands
-  below trigger.
+- **Full scan** runs a full market snapshot; **Quick scan** runs a quicker price scan - the same two scans the
+  commands below trigger (Full scan and Quick scan were called Scan and Browse before 0.11.0; the commands
+  themselves haven't changed).
 - **Stop** shows up only while a scan is running, and ends it right there.
-- An **auto-scan** checkbox, on by default: while it's ticked, opening the auction house runs one Browse scan by
+- An **auto-scan** checkbox, on by default: while it's ticked, opening the auction house runs one Quick scan by
   itself - once per visit, and never while the newest scan anyone in the group has made is under 30 minutes old,
   so a handful of people visiting an auctioneer make a handful of scans a day, not dozens. The scan may start a
   second or two after the house opens rather than the instant it does: the game's own auction house window
@@ -38,12 +39,14 @@ A small strip appears beside the auction house window:
 - One status line says what's happening: `waiting for the house to accept a query` while the scan waits for the
   client, `scanning ... page 3` while a scan runs, `last scan 6h ago` when the last one is old news, `the house
   is busy - try the button in a moment` if the game's own cooldown turned the query away even then (it isn't
-  tried again until you close and reopen the house), or `no prices yet - press Browse` the first time. It adds
-  `- press Send to upload` whenever there is something new to send.
-- **Send** uploads what you have learned - it reloads the UI, which is what writes the file.
+  tried again until you close and reopen the house), or `no prices yet - press Quick scan` the first time. It
+  adds `- press Sync to upload` whenever there is something new to send.
+- **Sync** uploads what you have learned - it reloads the UI, which is what writes the file (called Send before
+  0.11.0; `/tally reload` still does the same thing).
 
 Opening a profession window also reads its recipes, every time - nothing to type there either. A line beside the
-**Profit** button confirms it: `✓ learned 41 recipes, 3 new`, with its own **Send** button beside that line.
+**Profit** button confirms it: `✓ learned 41 recipes, 3 new`, with its own **Sync** button beside that line. The
+mailbox gets a **Sync** button too, on the mail frame itself, while it's open - see "Your mailbox" below.
 
 Also available, as typed commands - the strip's first two buttons do the same things as the first two rows below:
 
@@ -69,15 +72,17 @@ count, the price you received, the deposit and the auction house's cut; for one 
 cancelled, the item and the count. It also reads how many days the mail has left, only so it can tell the
 same mail apart from a new one later - not something it shows you. It reads while the mailbox is open, and
 only because you opened it: nothing happens while it's closed, and nothing goes anywhere until you press
-**Send** (or `/tally reload`), same as everything else it learns. It never reads or stores who bought
-anything, who sent a mail, or any other player's name. A mail from anyone titled `Auction expired: <name>` or
-`Auction cancelled: <name>` is filed as a returned auction under that name, on your own Sales page only - it
-never enters the group's figures.
+**Sync** (on the strip, on the mail window itself, or `/tally reload`), same as everything else it learns. It
+never reads or stores who bought anything, who sent a mail, or any other player's name. A mail from anyone
+titled `Auction expired: <name>` or `Auction canceled: <name>` (or `cancelled`, either spelling) is filed as a
+returned auction under that name, on your own Sales page only - it never enters the group's figures.
 
 With the tray app and a membership, your own sales and returns then show up in detail on the site - to you
 alone. The group only ever sees a median price and how many sold, per item, never whose. In game, the
-tooltip's `Market:` line gains a sale rate (`Market 16g 95s · sells ~3.2/day`), and the Profit line marks
-itself `(now)` when there isn't yet enough history for a market value, using today's price instead.
+tooltip's `Market value` line gains a sale rate (`Market value: 16g 95s · sells ~3.2 a day`), and Profit is
+worked out from that market value when there is one, quietly falling back to Lowest now when there isn't yet
+enough history for it - the same order the profession Profit panel uses, so hovering an item and opening the
+panel never disagree.
 
 ## The tray app (`tray/`)
 

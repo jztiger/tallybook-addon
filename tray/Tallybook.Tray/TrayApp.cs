@@ -77,6 +77,7 @@ namespace Tallybook.Tray
                 forceNext = false;
                 CycleReport report = await Task.Run(() => cycle.RunAsync(force));
                 Show(report.State, report.Reason);
+                if (report.ProductsChanged) Save(); // the last list the server sent, for the next start and for offline
                 if (report.AddonInstalled != null) icon.ShowBalloonTip(5000, AppInfo.Name, "The Tallybook addon is now version " + report.AddonInstalled + ".", ToolTipIcon.Info);
 
                 if (!config.Paused && DateTime.UtcNow - versionCheckedUtc > TimeSpan.FromHours(24))
@@ -196,7 +197,7 @@ namespace Tallybook.Tray
         /// <summary>The version installed in the game folder, or null when the addon is not there.</summary>
         private string? AddonVersionHere()
         {
-            foreach (string folder in GameFolders.AddonFolders(config.WowFolder))
+            foreach (string folder in GameFolders.AddonFolders(config.WowFolder, config.Products))
             {
                 string? v = AddonInstaller.InstalledVersion(folder);
                 if (v != null) return v;
@@ -230,15 +231,15 @@ namespace Tallybook.Tray
                     return;
                 }
 
-                var folders = new List<string>(GameFolders.AddonFolders(config.WowFolder));
+                var folders = new List<string>(GameFolders.AddonFolders(config.WowFolder, config.Products));
                 if (folders.Count == 0)
                 {
-                    string? fresh = GameFolders.InstallTarget(config.WowFolder);
+                    string? fresh = GameFolders.InstallTarget(config.WowFolder, config.Products);
                     if (fresh != null) folders.Add(fresh);
                 }
                 if (folders.Count == 0)
                 {
-                    MessageBox.Show("There is no game folder here to install the addon into.", AppInfo.Name, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    MessageBox.Show("None of the Forever game folders (" + string.Join(", ", config.Products) + ") is here to install the addon into.", AppInfo.Name, MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
                 }
                 foreach (string folder in folders) log.Write("from GitHub: " + AddonInstaller.Install(folder, published));

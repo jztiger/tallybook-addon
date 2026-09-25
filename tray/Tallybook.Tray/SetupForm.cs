@@ -42,7 +42,7 @@ namespace Tallybook.Tray
             };
             notice.Select(0, 0);
 
-            var folderLabel = new Label { AutoSize = true, Text = "Your World of Warcraft folder (the one that holds _classic_beta_ or similar):", Location = new Point(12, 324) };
+            var folderLabel = new Label { AutoSize = true, Text = "World of Warcraft folder (the folder that holds your Forever game, e.g. _classic_beta_):", Location = new Point(12, 324) };
             folder.Location = new Point(12, 346);
             folder.Size = new Size(516, 24);
             folder.Text = config.WowFolder;
@@ -120,7 +120,7 @@ namespace Tallybook.Tray
             bool looksRight = GameFolders.LooksLikeWow(folder.Text);
             folderHint.Text = folder.Text.Length == 0 ? "Pick the folder first."
                 : looksRight ? ""
-                : "That folder has no game inside it (no _classic_beta_ or similar). Pick the folder above it?";
+                : "That folder does not hold your Forever game (e.g. _classic_beta_). Pick the folder above it?";
             ok.Enabled = looksRight && understand.Checked;
         }
     }

@@ -4,7 +4,7 @@ namespace Tallybook.Tray
     public static class AppInfo
     {
         public const string Name = "Tallybook";
-        public const string Version = "0.1.0";
+        public const string Version = "0.2.0";
         /// <summary>An ordinary User-Agent: Cloudflare challenges odd ones.</summary>
         public const string UserAgent = "Tallybook-Tray/" + Version;
     }

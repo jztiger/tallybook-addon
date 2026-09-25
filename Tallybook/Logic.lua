@@ -9,7 +9,7 @@ ns = ns or {}
 local L = {}
 ns.Logic = L
 
-L.VERSION = "0.10.0"
+L.VERSION = "0.11.0"
 -- Two independent version counters, mirroring the server (src/shared/scan-schema.ts SCAN_SCHEMA_VERSION,
 -- src/shared/ref-doc.ts REF_SCHEMA_VERSION): the scan document's shape (replicate, browse) has not changed
 -- since M1, so buildDoc still tags SCAN_SCHEMA; the reference document gained items, suffixes and named
@@ -498,7 +498,7 @@ function L.initDB(db)
 end
 
 ---------------------------------------------------------------------------------------------------
--- Crafting cost (tooltip line "Crafting Cost: ..."). Pure arithmetic on three tables the addon keeps:
+-- Crafting cost (tooltip line "Craft cost: ..."). Pure arithmetic on three tables the addon keeps:
 --   recipes[outputItemID] = { { recipeID =, qty = <items made>, mats = { {itemID, qty}, ... } }, ... }
 --   prices[itemID]        = cheapest auction unit price, from the last complete browse scan
 --   vendor[itemID]        = unit price at a vendor the player has visited; when known it always wins
@@ -653,7 +653,9 @@ end
 -- itemID is a real id or 0 (Forever's invoice carries none, so the server matches by name); itemName is
 -- 1..MAX_NAME_CHARS bytes; count is at least 1; price, deposit and cut are copper and never negative (a
 -- returned auction's price is 0); outcome is "sold" or "returned"; expiresAt is the mail's own expiry, a
--- positive whole second.
+-- positive whole second. daysLeft (optional, D16 fix round 1) is the client's raw countdown for this mail, a
+-- fractional number of days: kept as the row's 9th element when it is a real number in 0..31 (the server's
+-- bound) and simply left off otherwise - never a reason to refuse the row. It is not part of the key.
 --
 -- DEDUP: this API gives a mail no id, so the same mail seen on two visits - or in two sessions - has to
 -- collapse to one row. What does not change while a mail sits in the box is its expiry, which was fixed when
@@ -663,7 +665,11 @@ end
 -- and the count field keeps stack totals honest. The server's UNIQUE index is the real guard across
 -- sessions; this only keeps one document from carrying the same mail twice.
 -- -> true when recorded
-function L.noteSale(db, itemID, itemName, count, price, deposit, cut, outcome, expiresAt)
+local function isDaysLeft(v)
+    return type(v) == "number" and v == v and v >= 0 and v <= 31
+end
+
+function L.noteSale(db, itemID, itemName, count, price, deposit, cut, outcome, expiresAt, daysLeft)
     if type(db) ~= "table" or type(db.sales) ~= "table" then return false end
     if not isCount(itemID, 0) or not validName(itemName) or not isCount(count, 1) then return false end
     if not isCount(price, 0) or not isCount(deposit, 0) or not isCount(cut, 0) then return false end
@@ -674,6 +680,7 @@ function L.noteSale(db, itemID, itemName, count, price, deposit, cut, outcome, e
     db.saleCount = db.saleCount or tableSize(db.sales) -- see L.noteItem
     if db.saleCount >= L.MAX_SALE_ROWS then return false end
     db.sales[key] = { itemID, itemName, count, price, deposit, cut, outcome, expiresAt }
+    if isDaysLeft(daysLeft) then db.sales[key][9] = daysLeft end
     db.saleCount = db.saleCount + 1
     return true
 end
@@ -989,7 +996,9 @@ function L.refDoc(db, at)
             if type(s) == "table" and isCount(s[1], 0) and validName(s[2]) and isCount(s[3], 1)
                 and isCount(s[4], 0) and isCount(s[5], 0) and isCount(s[6], 0) and OUTCOMES[s[7]]
                 and isCount(s[8], 1) then
-                sales[#sales + 1] = { s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8] }
+                local row = { s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8] }
+                if isDaysLeft(s[9]) then row[9] = s[9] end -- D16 fix round 1: the raw daysLeft, when there is one
+                sales[#sales + 1] = row
             end
         end
         -- Expiry then name is the order the document promises; outcome, count and price break the rest of
@@ -1120,6 +1129,13 @@ end
 ---------------------------------------------------------------------------------------------------
 
 -- 45 -> "45s", 600 -> "10m", 7200 -> "2h", 200000 -> "2d"
+-- 0.11.0: the word the player is told for a scan's kind - the Tally 2.0 vocabulary (Full scan was Scan, Quick
+-- scan was Browse). The kind itself never changes: it is what every document and the server carry.
+local SCAN_WORDS = { replicate = "full", browse = "quick" }
+function L.scanWord(kind)
+    return SCAN_WORDS[kind] or tostring(kind)
+end
+
 function L.formatAge(seconds)
     if type(seconds) ~= "number" or seconds ~= seconds or seconds < 0 then seconds = 0 end
     if seconds == math.huge then return "?" end

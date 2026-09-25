@@ -166,7 +166,7 @@ ns.on("AUCTION_HOUSE_CLOSED", function() ns.ahOpen = false end)
 
 -- 0.9.3: something this session has not gone into the saved file yet - a scan (Scan.lua's finishReplicate /
 -- finishBrowse / selftest) or a newly learned recipe (Craft.lua's learnRecipes, when it adds one). Read by
--- Strip.lua and Summary.lua to nudge "press Send to upload"; cleared by ns.reload below, before the reload
+-- Strip.lua, Summary.lua and Mail.lua to nudge "press Sync to upload"; cleared by ns.reload below, before the reload
 -- that is the only thing that ever writes it out. Not saved: like everything else session-only, it starts
 -- false every time the client loads.
 ns.pendingUpload = false
@@ -248,7 +248,7 @@ function commands.list(arg)
 end
 
 -- The only place in the addon that reloads the UI, and only because the player asked - by typing
--- /tally reload, or by clicking a Send button (Strip.lua, Summary.lua): both call this SAME function
+-- /tally reload, or by clicking a Sync button (Strip.lua, Summary.lua, Mail.lua): both call this SAME function
 -- (commands.reload below is a plain alias, not a second body), so there is still exactly one ReloadUI()
 -- call site in the whole addon, wherever it was asked for from (0.9.3).
 function ns.reload()
@@ -278,7 +278,7 @@ SlashCmdList["TALLYBOOK"] = function(msg)
     reported = {}
     local command = commands[word]
     if not command then
-        ns.print("open the auction house - it scans; buttons for Scan / Browse / Stop are on the frame.")
+        ns.print("open the auction house - it scans; buttons for Quick scan / Full scan / Stop / Sync are on the frame.")
         ns.print("commands: /tally (status) | scan | browse | profit | basket | list | selftest | reload")
         return
     end

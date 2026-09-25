@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Runtime.Serialization;
 using System.Text;
@@ -29,6 +30,7 @@ namespace Tallybook.Tray
             [DataMember(Name = "acceptedNotice", Order = 9, EmitDefaultValue = false)] public bool? AcceptedNotice { get; set; }
             [DataMember(Name = "acceptedNoticeVersion", Order = 11, EmitDefaultValue = false)] public int? AcceptedNoticeVersion { get; set; }
             [DataMember(Name = "paused", Order = 10, EmitDefaultValue = false)] public bool? Paused { get; set; }
+            [DataMember(Name = "products", Order = 13, EmitDefaultValue = false)] public List<string?>? Products { get; set; }
         }
 
         /// <summary>The server's tallybook.config.json. Null when it is not a complete one.</summary>
@@ -76,6 +78,7 @@ namespace Tallybook.Tray
                 StartWithWindows = c.StartWithWindows,
                 AcceptedNoticeVersion = c.AcceptedNoticeVersion,
                 Paused = c.Paused,
+                Products = new List<string?>(c.Products),
             };
             string? dir = Path.GetDirectoryName(path);
             if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
@@ -114,6 +117,8 @@ namespace Tallybook.Tray
             // A config written before the notice had versions: what they accepted was version 1.
             AcceptedNoticeVersion = s.AcceptedNoticeVersion ?? ((s.AcceptedNotice ?? false) ? 1 : 0),
             Paused = s.Paused ?? false,
+            // A file from before the list has none; a hand-edited one may hold names that must never become paths.
+            Products = ForeverProducts.Choose(ForeverProducts.Default, s.Products),
         };
 
         private static string? Open(string? stored, ISecretProtector protector)

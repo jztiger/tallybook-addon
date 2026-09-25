@@ -24,27 +24,31 @@ namespace Tallybook.Tray.Tests
         public string AddonETag = "\"addon1\"";
         public int AddonStatus = 200;
         public int AddonRequests;
+        /// <summary>The server's FOREVER_PRODUCTS, as its manifest carries them. Null: a server from before the list.</summary>
+        public string[]? Products = { "_classic_beta_" };
         public string ETag = "\"v1\"";
         public int IngestStatus = 200;
         public Cycle Cycle;
 
         /// <summary>A manifest in the shape the server sends: a .toc with that version, and one Lua file.</summary>
-        public static string AddonJson(string version)
+        public static string AddonJson(string version, string[]? products = null)
         {
             string toc = "## Interface: 16001\n## Title: Tallybook\n## Version: " + version + "\n\nLogic.lua\nData.lua\n";
             string logic = "local _, ns = ...\n-- " + version + "\n";
             string empty = "-- GENERATED\nns.baked = {\n}\n";
             string One(string n, string c) => "{\"name\":\"" + n + "\",\"sha256\":\"" + AddonManifest.Hash(c) + "\",\"content\":" + Quote(c) + "}";
-            return "{\"version\":\"" + version + "\",\"files\":[" + One("Tallybook.toc", toc) + "," + One("Logic.lua", logic) + "," + One("Data.lua", empty) + "]}";
+            string list = products == null ? "" : ",\"products\":[" + string.Join(",", products.Select(Quote)) + "]";
+            return "{\"version\":\"" + version + "\",\"files\":[" + One("Tallybook.toc", toc) + "," + One("Logic.lua", logic) + "," + One("Data.lua", empty) + "]" + list + "}";
         }
 
         private static string Quote(string s) => "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n") + "\"";
 
-        public World(bool addonInstalled = true)
+        /// <param name="product">The game's product folder on this pretend PC - renamed at launch, retail on some PCs.</param>
+        public World(bool addonInstalled = true, string product = "_classic_beta_")
         {
             Wow = Path.Combine(Dir.Path, "World of Warcraft");
-            Saved = Path.Combine(Wow, "_classic_beta_", "WTF", "Account", "ACCT#1", "SavedVariables", "Tallybook.lua");
-            DataLua = Path.Combine(Wow, "_classic_beta_", "Interface", "AddOns", "Tallybook", "Data.lua");
+            Saved = Path.Combine(Wow, product, "WTF", "Account", "ACCT#1", "SavedVariables", "Tallybook.lua");
+            DataLua = Path.Combine(Wow, product, "Interface", "AddOns", "Tallybook", "Data.lua");
             LogFile = Dir.File("log.txt");
             Directory.CreateDirectory(Path.GetDirectoryName(Saved)!);
             if (addonInstalled)
@@ -55,7 +59,7 @@ namespace Tallybook.Tray.Tests
             }
             else
             {
-                Directory.CreateDirectory(Path.Combine(Wow, "_classic_beta_", "Interface", "AddOns"));
+                Directory.CreateDirectory(Path.Combine(Wow, product, "Interface", "AddOns"));
             }
             Config.WowFolder = Wow;
             Config.AcceptedNoticeVersion = 2;
@@ -67,7 +71,7 @@ namespace Tallybook.Tray.Tests
                     AddonRequests++;
                     if (AddonStatus != 200) return FakeServer.Status(AddonStatus, "{}");
                     if (r.Headers.TryGetValue("If-None-Match", out string? a) && a == AddonETag) return FakeServer.Status(304, "");
-                    var m = FakeServer.Status(200, AddonJson(AddonVersion));
+                    var m = FakeServer.Status(200, AddonJson(AddonVersion, Products));
                     m.Headers.TryAddWithoutValidation("ETag", AddonETag);
                     return m;
                 }
@@ -400,12 +404,87 @@ namespace Tallybook.Tray.Tests
         }
 
         [Fact]
-        public async Task Switched_off_it_never_asks_for_the_addon_at_all()
+        public async Task Switched_off_it_installs_nothing_but_still_learns_the_product_folders_on_the_same_cadence()
+        {
+            // Changed knowingly (FOREVER_PRODUCTS): the manifest is also where the product folders come from, and a
+            // player who switched updates off must not stop uploading on launch day. It is read; nothing is written.
+            using var w = new World(addonInstalled: false);
+            w.Config.KeepAddonUpToDate = false;
+            w.Products = new[] { "_classic_forever_", "_classic_beta_" };
+            CycleReport r = await w.Cycle.RunAsync(true);
+
+            Assert.Equal(1, w.AddonRequests);
+            Assert.Null(r.AddonInstalled);
+            Assert.False(Directory.Exists(Path.GetDirectoryName(w.DataLua)!));
+            Assert.Equal(new[] { "_classic_forever_", "_classic_beta_" }, w.Config.Products);
+            Assert.True(r.ProductsChanged);
+
+            w.Now = w.Now.AddMinutes(5);
+            await w.Cycle.RunAsync(false);
+            Assert.Equal(1, w.AddonRequests); // not asked again so soon
+        }
+
+        [Fact]
+        public async Task Launch_day_the_folder_is_renamed_and_one_pass_learns_it_and_the_saved_file_then_goes_out()
+        {
+            // The PC still holds the beta's list; the server now says the game is in _classic_forever_.
+            using var w = new World(product: "_classic_forever_");
+            w.Products = new[] { "_classic_forever_", "_classic_beta_" };
+            w.Save("TallybookDB = { one = 1 }");
+            Assert.Equal(new[] { "_classic_beta_" }, w.Config.Products);
+
+            CycleReport first = await w.Cycle.RunAsync(true);
+            Assert.Equal(TrayState.Ok, first.State); // not "the folder is not there"
+            Assert.True(first.ProductsChanged);
+            Assert.Equal(new[] { "_classic_forever_", "_classic_beta_" }, w.Config.Products);
+            Assert.Equal(1, first.Wrote); // Data.lua in the renamed folder, in that same pass
+
+            // The saved file was out of sight in the first pass (the old list), so it is first seen now and sent once
+            // it is quiet - the ordinary two looks.
+            CycleReport later = await w.RunUntilStable();
+            Assert.Equal(1, later.Uploaded);
+            Assert.Equal(1, w.Count("/ingest"));
+            Assert.False(later.ProductsChanged);
+        }
+
+        [Fact]
+        public async Task A_first_install_after_the_rename_goes_into_the_renamed_folder()
+        {
+            using var w = new World(addonInstalled: false, product: "_classic_forever_");
+            w.Products = new[] { "_classic_forever_" };
+            CycleReport r = await w.Cycle.RunAsync(true);
+            Assert.Equal("0.9.0", r.AddonInstalled);
+            Assert.Equal("0.9.0", AddonInstaller.InstalledVersion(Path.GetDirectoryName(w.DataLua)!));
+        }
+
+        [Fact]
+        public async Task A_server_from_before_the_list_or_a_list_of_nothing_usable_keeps_the_list_held()
         {
             using var w = new World();
-            w.Config.KeepAddonUpToDate = false;
-            await w.Cycle.RunAsync(true);
-            Assert.Equal(0, w.AddonRequests);
+            w.Config.Products = new[] { "_classic_beta_", "_classic_era_" };
+            w.Products = null;
+            CycleReport r = await w.Cycle.RunAsync(true);
+            Assert.False(r.ProductsChanged);
+            Assert.Equal(new[] { "_classic_beta_", "_classic_era_" }, w.Config.Products);
+
+            w.Products = new[] { "..\\evil", "_Retail_" };
+            w.AddonETag = "\"addon2\"";
+            r = await w.Cycle.RunAsync(true);
+            Assert.False(r.ProductsChanged);
+            Assert.Equal(new[] { "_classic_beta_", "_classic_era_" }, w.Config.Products);
+        }
+
+        [Fact]
+        public async Task A_pc_with_only_retail_gets_no_addon_and_sends_nothing_and_does_not_keep_asking()
+        {
+            using var w = new World(addonInstalled: false, product: "_retail_");
+            w.Save("TallybookDB = { one = 1 }");
+            CycleReport r = await w.RunUntilStable();
+
+            Assert.Null(r.AddonInstalled);
+            Assert.False(Directory.Exists(Path.GetDirectoryName(w.DataLua)!));
+            Assert.Equal(0, w.Count("/ingest"));
+            Assert.Equal(1, w.AddonRequests); // once, on the cadence - not every two seconds
         }
 
         [Fact]

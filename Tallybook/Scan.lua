@@ -108,7 +108,7 @@ end
 -- The checks every real scan shares. -> meta, or nil after saying why not.
 local function ready(api, events)
     if current then
-        ns.print("a " .. current.kind .. " scan is already running")
+        ns.print("a " .. Logic.scanWord(current.kind) .. " scan is already running")
         return nil
     end
     if not ns.ahOpen then
@@ -276,7 +276,7 @@ local function finishReplicate(run, agg, n, unreadable, noLink)
     })
     ns.Export.save(doc)
     lastScanAt = t1 -- the market was read, complete or not: the strip counts it as this session's newest
-    ns.pendingUpload = true -- 0.9.3: something is now waiting on a Send / /tally reload to go out
+    ns.pendingUpload = true -- 0.9.3: something is now waiting on a Sync / /tally reload to go out
 end
 
 local function processReplicate(run, n)
@@ -534,7 +534,7 @@ local sendingOwn = false
 
 local function abandonBrowse(run, why)
     if current == run then current = nil end
-    ns.print("browse scan: " .. why .. ", so the results are no longer this scan's. Nothing was saved and the"
+    ns.print("quick scan: " .. why .. ", so the results are no longer this scan's. Nothing was saved and the"
         .. " tooltip prices were left alone. Run /tally browse again, and leave the search alone until it is done.")
 end
 
@@ -617,7 +617,7 @@ local function finishBrowse(run, complete, why)
     current = nil
     if not run.answered then
         -- The list still holds whatever was searched for last; none of it answers this scan's query.
-        ns.print("browse scan: no answer to this scan's query" .. (why and (" (" .. why .. ")") or "")
+        ns.print("quick scan: no answer to this scan's query" .. (why and (" (" .. why .. ")") or "")
             .. ". Nothing was saved.")
         return
     end
@@ -625,7 +625,7 @@ local function finishBrowse(run, complete, why)
     local safe = withoutSecrets(results)
     local rows = Logic.browseRows(safe)
     if #rows == 0 then
-        ns.print("browse scan: no rows" .. (why and (" (" .. why .. ")") or "") .. ". Nothing was saved.")
+        ns.print("quick scan: no rows" .. (why and (" (" .. why .. ")") or "") .. ". Nothing was saved.")
         return
     end
     if complete and #rows ~= #results then
@@ -635,7 +635,7 @@ local function finishBrowse(run, complete, why)
         why = string.format("%.0f of %.0f rows could not be read", #results - #rows, #results)
     end
     local t1 = ns.serverTime()
-    ns.print(string.format("browse scan: %.0f item keys in %.0f %s, %.1f s", #rows, run.pages,
+    ns.print(string.format("quick scan: %.0f item keys in %.0f %s, %.1f s", #rows, run.pages,
         run.pages == 1 and "page" or "pages", seconds(run)))
     if complete then
         local db = ns.db()
@@ -650,7 +650,7 @@ local function finishBrowse(run, complete, why)
     local doc = Logic.buildDoc(run.meta, "browse", complete, run.t0, t1, rows, { uid = run.uid, rowCount = #results })
     ns.Export.save(doc)
     lastScanAt = t1 -- the market was read, complete or not: the strip counts it as this session's newest
-    ns.pendingUpload = true -- 0.9.3: something is now waiting on a Send / /tally reload to go out
+    ns.pendingUpload = true -- 0.9.3: something is now waiting on a Sync / /tally reload to go out
     -- M2: item names, quality and the full names of any suffixed keys, learned from this scan's own
     -- results only (Ruling A/B) - after the scan is safely saved, like the variant learning right below.
     noteBrowseNames(safe)
@@ -968,7 +968,7 @@ end
 -- -> false after saying why, when nothing was started.
 function Scan.ladders(itemIDs, done)
     if current then
-        ns.print("a " .. current.kind .. " scan is already running")
+        ns.print("a " .. Logic.scanWord(current.kind) .. " scan is already running")
         return false
     end
     if not ns.ahOpen then
@@ -1023,7 +1023,7 @@ end)
 -- with its own realm name so that its made-up prices can never land in a real market's history.
 function Scan.selftest()
     if current then
-        ns.print("a " .. current.kind .. " scan is already running")
+        ns.print("a " .. Logic.scanWord(current.kind) .. " scan is already running")
         return
     end
     local ok, why = ns.Export.available()
@@ -1057,5 +1057,5 @@ function Scan.selftest()
         suffixSeen = agg.suffixSeen,
     })
     ns.Export.save(doc)
-    ns.pendingUpload = true -- 0.9.3: something is now waiting on a Send / /tally reload to go out
+    ns.pendingUpload = true -- 0.9.3: something is now waiting on a Sync / /tally reload to go out
 end

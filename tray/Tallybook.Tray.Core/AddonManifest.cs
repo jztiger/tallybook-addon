@@ -44,6 +44,12 @@ namespace Tallybook.Tray
 
         [DataMember(Name = "version")] public string Version { get; set; } = "";
         [DataMember(Name = "files")] public List<AddonFile> Files { get; set; } = new List<AddonFile>();
+        /// <summary>
+        /// Forever's product folders, in order (the server's FOREVER_PRODUCTS). Null from a server that predates the
+        /// list - the serializer skips initialisers, so absent means null. Never part of <see cref="Reject"/>: a bad
+        /// entry is dropped by <see cref="ForeverProducts.Choose"/>, and the addon itself is still fine.
+        /// </summary>
+        [DataMember(Name = "products", IsRequired = false)] public List<string?>? Products { get; set; }
 
         /// <summary>A plain addon file name and nothing else. Checked before a name is ever used as a path.</summary>
         public static bool IsPlainName(string? name) => name != null && PlainName.IsMatch(name);

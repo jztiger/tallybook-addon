@@ -30,7 +30,7 @@ local function scrollBox()
 end
 
 -- What a row says; nil for a recipe never seen.
---   list = "profit" (default): "+<money>" green or "-<money>" red - crafting to sell at the Min AH Price
+--   list = "profit" (default): "+<money>" green or "-<money>" red - crafting to sell at Lowest now
 --   list = "cost":             the crafting cost, green when the craft pays and red when it does not
 -- When the profit cannot be told (a mat with no price, nobody selling) both fall back to the plain cost:
 -- "<money>", "<money> +?" when some mats have no price, "?" when none has.

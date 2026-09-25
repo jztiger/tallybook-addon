@@ -1,4 +1,4 @@
--- Tallybook: the auction house strip - Scan / Browse / Stop, an auto-scan switch and one status line
+-- Tallybook: the auction house strip - Full scan / Quick scan / Stop / Sync, an auto-scan switch and one status line
 -- beside the game's auction house window - and the one browse scan that may start itself when the house
 -- opens (docs/decisions.md C7, revised by the owner 2026-09-23).
 --
@@ -40,8 +40,9 @@
 -- and a client that has no auction house window gets no strip and no scan of its own accord - the
 -- commands still work, and nothing the player cannot see ever starts.
 --
--- Send (0.9.3) is a click; it is the only thing besides /tally reload that reloads the UI, and nothing
--- reloads it without one.
+-- Sync (0.9.3, called Send until 0.11.0) is a click; it and the other Sync buttons (the profession window,
+-- the mail window) are the only things besides /tally reload that reload the UI, and nothing reloads it
+-- without one. 0.11.0 took the Tally 2.0 words: Full scan was Scan, Quick scan was Browse, Sync was Send.
 
 local _, ns = ...
 local Logic = ns.Logic
@@ -49,8 +50,9 @@ local Logic = ns.Logic
 local Strip = {}
 ns.Strip = Strip
 
-local BUTTON_W, BUTTON_H = 60, 22
-local WIDTH, HEIGHT = 250, 76 -- four buttons wide since 0.9.3 (Scan, Browse, Stop, Send)
+local BUTTON_W, BUTTON_H = 50, 22
+local SCAN_W = 76 -- room for "Quick scan" and "Full scan" (0.11.0)
+local WIDTH, HEIGHT = 258, 76 -- four buttons wide since 0.9.3 (Full scan, Quick scan, Stop, Sync)
 
 -- What is true of THIS opening of the auction house. Either one is enough to stop a second scan, and only
 -- AUCTION_HOUSE_CLOSED clears them - with one exception, in the two places marked "refused" below: a scan
@@ -155,13 +157,13 @@ end
 
 -- Limit 5: one line that always says what is happening. A scan in progress wins over everything else;
 -- otherwise the player is told why no scan started, or how old the prices they are looking at are - with
--- one suffix (0.9.3), appended to whatever the line would otherwise say: " - press Send to upload" while
+-- one suffix (0.9.3), appended to whatever the line would otherwise say: " - press Sync to upload" while
 -- ns.pendingUpload is true (a scan or a newly learned recipe this session, nothing sent since). Not while
 -- a scan is running: there is nothing yet to send from THIS scan, and the busy line matters more.
 local function statusText(status)
     if status.busy then
         -- A browse run whose query the client has not taken yet: the single wait of limit 1, and the wait a
-        -- clicked Browse has always been allowed. Either way there is something running to see and to stop.
+        -- clicked Quick scan has always been allowed. Either way there is something running to see and to stop.
         if status.waiting then return "waiting for the house to accept a query" end
         if status.kind == "browse" and type(status.pages) == "number" and status.pages > 0 then
             return string.format("scanning ... page %.0f", status.pages)
@@ -177,12 +179,12 @@ local function statusText(status)
     else
         local newest = newestScanAt(status)
         if newest <= 0 then
-            text = "no prices yet - press Browse"
+            text = "no prices yet - press Quick scan"
         else
             text = "last scan " .. Logic.formatAge(ns.serverTime() - newest) .. " ago"
         end
     end
-    if ns.pendingUpload then text = text .. " - press Send to upload" end
+    if ns.pendingUpload then text = text .. " - press Sync to upload" end
     return text
 end
 
@@ -212,11 +214,11 @@ local function build(parent)
     -- Outside the window's right edge, like the Profit panel: it covers nothing of the game's own.
     frame:SetPoint("TOPLEFT", parent, "TOPRIGHT", 2, -28)
 
-    frame.scanButton = newButton(frame, BUTTON_W, "Scan", function()
+    frame.scanButton = newButton(frame, SCAN_W, "Full scan", function()
         ns.Scan.replicate()
         paint()
     end)
-    frame.browseButton = newButton(frame, BUTTON_W, "Browse", function()
+    frame.browseButton = newButton(frame, SCAN_W, "Quick scan", function()
         ns.Scan.browse()
         paint()
     end)
@@ -226,14 +228,14 @@ local function build(parent)
     end)
     -- 0.9.3: the only other click that reloads the UI, through the SAME ns.reload as /tally reload - see
     -- the file header. Always shown, unlike Stop: sending is never tied to a scan being in progress.
-    frame.sendButton = newButton(frame, BUTTON_W, "Send", function()
+    frame.sendButton = newButton(frame, BUTTON_W, "Sync", function()
         ns.reload()
         paint()
     end)
     if not (frame.scanButton and frame.browseButton and frame.stopButton and frame.sendButton) then
         error("this client could not build a button")
     end
-    withTooltip(frame.sendButton, "Send - reloads the UI")
+    withTooltip(frame.sendButton, "Sync - reloads the UI")
     frame.scanButton:SetPoint("TOPLEFT", frame, "TOPLEFT", 0, 0)
     frame.browseButton:SetPoint("TOPLEFT", frame.scanButton, "TOPRIGHT", 2, 0)
     frame.stopButton:SetPoint("TOPLEFT", frame.browseButton, "TOPRIGHT", 2, 0)
