@@ -1016,6 +1016,51 @@ ns.on("ITEM_SEARCH_RESULTS_UPDATED", function(itemKey)
 end)
 
 ---------------------------------------------------------------------------------------------------
+-- A shopping list's Search (0.12.0): one search in the game's own window, for one mat, on a click
+---------------------------------------------------------------------------------------------------
+
+-- Called from the shopping list's row click (Shopping.lua) and from nowhere else - so every search is the player's
+-- own click (C7), one query per click. It fills the auction house window's own search box and starts it, exactly
+-- as typing the name and pressing Enter would: the results are in Blizzard's window, and buying stays there, the
+-- player's own click on Blizzard's own button. Nothing here reads a result, retries, waits or runs later. Refused,
+-- with the reason, while a scan of ours is running (a search would land in its result list), while the house is
+-- busy (the query would be dropped - the player clicks again), or when the window has no search box to fill.
+-- -> true when the search was started.
+function Scan.search(name)
+    if current then
+        -- The variant learner's few lookups finish a quick scan the player started, and it was never announced:
+        -- to the player it is still that quick scan.
+        local kind = current.kind == "learn" and "browse" or current.kind
+        ns.print("a " .. Logic.scanWord(kind) .. " scan is running - wait for it, or press Stop")
+        return false
+    end
+    if not ns.ahOpen then
+        ns.print("open the auction house first")
+        return false
+    end
+    local w = type(AuctionHouseFrame) == "table" and AuctionHouseFrame or nil
+    local bar = w and w.SearchBar
+    if type(bar) ~= "table" or type(bar.SetSearchText) ~= "function" or type(bar.StartSearch) ~= "function" then
+        ns.print("this auction house has no search box to fill - search for " .. tostring(name) .. " yourself")
+        return false
+    end
+    if type(C_AuctionHouse) == "table" and type(C_AuctionHouse.IsThrottledMessageSystemReady) == "function" then
+        local okReady, ready = pcall(C_AuctionHouse.IsThrottledMessageSystemReady)
+        if okReady and ready == false then
+            ns.print("the house is busy - click the row again in a moment")
+            return false
+        end
+    end
+    local ok = pcall(bar.SetSearchText, bar, name)
+    ok = ok and pcall(bar.StartSearch, bar)
+    if not ok then
+        ns.print("could not start a search for " .. tostring(name) .. " - search for it yourself")
+        return false
+    end
+    return true
+end
+
+---------------------------------------------------------------------------------------------------
 -- /tally selftest : one small synthetic scan through the real aggregator and the real export
 ---------------------------------------------------------------------------------------------------
 

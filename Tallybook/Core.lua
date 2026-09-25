@@ -238,6 +238,11 @@ function commands.basket(arg, msg)
     ns.Craft.basket(crafts, chosen)
 end
 
+-- /tally shopping : the shopping list planned on the web (0.12.0) - shown at the auction house (Shopping.lua)
+function commands.shopping()
+    ns.Shopping.command()
+end
+
 -- /tally list profit | cost : what the number next to each recipe in the profession window is
 function commands.list(arg)
     if arg == "profit" or arg == "cost" then
@@ -279,7 +284,7 @@ SlashCmdList["TALLYBOOK"] = function(msg)
     local command = commands[word]
     if not command then
         ns.print("open the auction house - it scans; buttons for Quick scan / Full scan / Stop / Sync are on the frame.")
-        ns.print("commands: /tally (status) | scan | browse | profit | basket | list | selftest | reload")
+        ns.print("commands: /tally (status) | scan | browse | profit | basket | shopping | list | selftest | reload")
         return
     end
     local ok, err = pcall(command, arg, msg)

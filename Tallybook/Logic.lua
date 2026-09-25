@@ -9,7 +9,7 @@ ns = ns or {}
 local L = {}
 ns.Logic = L
 
-L.VERSION = "0.11.0"
+L.VERSION = "0.12.0"
 -- Two independent version counters, mirroring the server (src/shared/scan-schema.ts SCAN_SCHEMA_VERSION,
 -- src/shared/ref-doc.ts REF_SCHEMA_VERSION): the scan document's shape (replicate, browse) has not changed
 -- since M1, so buildDoc still tags SCAN_SCHEMA; the reference document gained items, suffixes and named
@@ -1122,6 +1122,69 @@ function L.applyBaked(db, baked, now)
     if type(baked.market) == "table" then db.market = cleanCounts(baked.market, 1) end
     if type(baked.sells) == "table" then db.sells = cleanCounts(baked.sells, 0) end
     return vendorAdded, recipesAdded, adoptPrices(db, baked, now)
+end
+
+---------------------------------------------------------------------------------------------------
+-- The shopping list (0.12.0): planned on the web, carried back in the member's own Data.lua
+---------------------------------------------------------------------------------------------------
+
+-- The owner's ruling of 2026-09-25 (Tally 2.0 open decision 3, inside C17): a list the member sent from the
+-- Workbench rides their OWN data file as baked.shopping (src/shared/bake.ts's renderShopping). Read here and only
+-- here, so a damaged or half-written list can never reach the panel as anything but "no list": a list needs a
+-- recipe id, a batch, when it was sent and at least one mat; a mat that does not read is left out; a figure that
+-- is not a whole number of copper is unknown (left out), never a 0.
+L.SHOPPING_MAX_MATS = 32
+
+local function optCount(v)
+    if isCount(v, 0) then return v end
+    return nil
+end
+
+function L.shoppingList(baked)
+    if type(baked) ~= "table" or type(baked.shopping) ~= "table" then return nil end
+    local s = baked.shopping
+    if not isCount(s.recipeID, 1) or not isCount(s.n, 1) or not isCount(s.at, 0) or type(s.mats) ~= "table" then
+        return nil
+    end
+    local list = { recipeID = s.recipeID, n = s.n, at = s.at, mats = {} }
+    if type(s.name) == "string" and s.name ~= "" then list.name = s.name end
+    list.cost = optCount(s.cost)
+    if isInt(s.profit) then list.profit = s.profit end
+    for i = 1, #s.mats do
+        local m = s.mats[i]
+        if #list.mats >= L.SHOPPING_MAX_MATS then break end
+        if type(m) == "table" and isCount(m.itemID, 1) and isCount(m.need, 1) then
+            local mat = { itemID = m.itemID, need = m.need, vendor = m.vendor == true }
+            if type(m.name) == "string" and m.name ~= "" then mat.name = m.name end
+            mat.each = optCount(m.each)
+            mat.payUpTo = optCount(m.payUpTo)
+            list.mats[#list.mats + 1] = mat
+        end
+    end
+    if #list.mats == 0 then return nil end
+    return list
+end
+
+-- list, have ({ [itemID] = count in the bags }, or nil when the client cannot count them) -> one row per mat:
+-- how many are in the bags, how many are still to buy (never below 0), and whether the bags already hold enough.
+function L.shoppingRows(list, have)
+    local rows = {}
+    for i = 1, #list.mats do
+        local m = list.mats[i]
+        local count = nil
+        if type(have) == "table" then count = isCount(have[m.itemID], 0) and have[m.itemID] or 0 end
+        local buy = m.need - (count or 0)
+        if buy < 0 then buy = 0 end
+        rows[i] = { itemID = m.itemID, name = m.name, need = m.need, have = count, buy = buy,
+            enough = count ~= nil and count >= m.need, each = m.each, payUpTo = m.payUpTo, vendor = m.vendor }
+    end
+    return rows
+end
+
+-- "20 x Lesser Healing Potion · planned on the web 2h ago"
+function L.shoppingHeading(list, now)
+    local what = list.name or ("recipe " .. string.format("%.0f", list.recipeID))
+    return string.format("%.0f", list.n) .. " x " .. what .. " · planned on the web " .. L.formatAge(now - list.at) .. " ago"
 end
 
 ---------------------------------------------------------------------------------------------------
