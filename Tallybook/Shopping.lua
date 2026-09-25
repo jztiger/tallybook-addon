@@ -4,10 +4,12 @@
 -- ns.baked.shopping; Logic.shoppingList reads it, so a damaged one is simply no list.
 --
 -- Each row: the mat, how many are in the bags (C_Item.GetItemCount, repainted on the game's own bag event), how
--- many are still to buy, the average price the web walked for the batch, and "pay up to" - the price per unit
--- where the whole craft stops paying. A click on a row asks Scan.lua for ONE search in the game's own window
--- (Scan.search): the player's click, one query (C7); the results and the buying stay in Blizzard's window. A
--- vendor's mat is not searched for.
+-- many are in the bank (0.12.1 - C_Item.GetItemCount(id, true) minus the bags count, read live on every paint,
+-- never stored: the owner's probe of 2026-09-25 found includeBank answers correctly even on a session that never
+-- opened the bank), how many are still to buy (bags and bank both taken off), the average price the web walked
+-- for the batch, and "pay up to" - the price per unit where the whole craft stops paying. A click on a row asks
+-- Scan.lua for ONE search in the game's own window (Scan.search): the player's click, one query (C7); the
+-- results and the buying stay in Blizzard's window. A vendor's mat is not searched for.
 --
 -- What this file does NOT do: it sends nothing to the auction house itself (Scan.lua is the one file that does),
 -- owns no clock of any kind (the compliance test holds it to that), never repeats or retries a search, and
@@ -21,16 +23,17 @@ local Logic = ns.Logic
 local Shopping = {}
 ns.Shopping = Shopping
 
-local WIDTH, ROW_H = 420, 20
+local WIDTH, ROW_H = 458, 20
 local TOP = 62 -- where the rows start, below the title, the heading and the column headers
 -- columns: key, header, left edge, width, alignment
 local COLUMNS = {
     { "name", "Mat", 10, 150, "LEFT" },
     { "bags", "Bags", 162, 36, "RIGHT" },
-    { "buy", "Buy", 200, 36, "RIGHT" },
-    { "each", "Avg", 238, 60, "RIGHT" },
-    { "payUpTo", "Pay up to", 300, 70, "RIGHT" },
-    { "action", "", 372, 44, "RIGHT" },
+    { "bank", "Bank", 200, 36, "RIGHT" },
+    { "buy", "Buy", 238, 36, "RIGHT" },
+    { "each", "Avg", 276, 60, "RIGHT" },
+    { "payUpTo", "Pay up to", 338, 70, "RIGHT" },
+    { "action", "", 410, 44, "RIGHT" },
 }
 local CAPTION = "Pay up to is the price where the whole craft stops paying. Each Search sends one auction house query; "
     .. "buying stays in Blizzard's window."
@@ -87,6 +90,27 @@ local function bags(list)
         local itemID = list.mats[i].itemID
         local ok, count = pcall(C_Item.GetItemCount, itemID)
         if ok and not ns.isSecret(count) and type(count) == "number" then have[itemID] = count else have[itemID] = 0 end
+    end
+    return have
+end
+
+-- { [itemID] = count in the bank } for the list's mats: C_Item.GetItemCount(id, true) counts bags AND bank, so
+-- the bank alone is that minus the plain (bags-only) call - never below 0. Read live on every paint (0.12.1); no
+-- snapshot, nothing stored (the owner's ruling of 2026-09-25: alts' banks are a separate, unbuilt feature). A mat
+-- whose count cannot be read BOTH ways - no C_Item.GetItemCount at all, or either call answering anything but a
+-- plain number - is left out of the table entirely: unknown, never guessed as 0.
+local function bank(list)
+    if type(C_Item) ~= "table" or type(C_Item.GetItemCount) ~= "function" then return nil end
+    local have = {}
+    for i = 1, #list.mats do
+        local itemID = list.mats[i].itemID
+        local okBags, inBags = pcall(C_Item.GetItemCount, itemID)
+        local okTotal, total = pcall(C_Item.GetItemCount, itemID, true)
+        if okBags and okTotal and not ns.isSecret(inBags) and not ns.isSecret(total)
+            and type(inBags) == "number" and type(total) == "number" then
+            local diff = total - inBags
+            have[itemID] = diff > 0 and diff or 0
+        end
     end
     return have
 end
@@ -212,7 +236,7 @@ local function paint(list)
         return
     end
     panel.heading:SetText(Logic.shoppingHeading(list, ns.serverTime()))
-    local rows = Logic.shoppingRows(list, bags(list))
+    local rows = Logic.shoppingRows(list, bags(list), bank(list))
     for i = 1, #rows do
         local r = rows[i]
         local row = panel.rows[i]
@@ -225,6 +249,7 @@ local function paint(list)
         row.name:SetText(label)
         local have = r.have == nil and "-" or string.format("%.0f", r.have)
         row.bags:SetText(r.enough and (GREEN .. have .. CLOSE) or have)
+        row.bank:SetText(r.bank == nil and "—" or string.format("%.0f", r.bank))
         row.buy:SetText(string.format("%.0f", r.buy))
         row.each:SetText(money(r.each))
         row.payUpTo:SetText(money(r.payUpTo))
@@ -292,7 +317,7 @@ function Shopping.command()
     if not show() then
         -- No panel on this client: the list in chat instead, one mat a line.
         ns.print(Logic.shoppingHeading(list, ns.serverTime()))
-        local rows = Logic.shoppingRows(list, bags(list))
+        local rows = Logic.shoppingRows(list, bags(list), bank(list))
         for i = 1, #rows do
             local label = nameOf(rows[i].itemID, rows[i].name)
             ns.print("  " .. string.format("%.0f", rows[i].buy) .. " x " .. label)

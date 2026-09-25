@@ -9,7 +9,7 @@ ns = ns or {}
 local L = {}
 ns.Logic = L
 
-L.VERSION = "0.12.0"
+L.VERSION = "0.12.1"
 -- Two independent version counters, mirroring the server (src/shared/scan-schema.ts SCAN_SCHEMA_VERSION,
 -- src/shared/ref-doc.ts REF_SCHEMA_VERSION): the scan document's shape (replicate, browse) has not changed
 -- since M1, so buildDoc still tags SCAN_SCHEMA; the reference document gained items, suffixes and named
@@ -1165,17 +1165,22 @@ function L.shoppingList(baked)
     return list
 end
 
--- list, have ({ [itemID] = count in the bags }, or nil when the client cannot count them) -> one row per mat:
--- how many are in the bags, how many are still to buy (never below 0), and whether the bags already hold enough.
-function L.shoppingRows(list, have)
+-- list, have ({ [itemID] = count in the bags }, or nil when the client cannot count them), bank ({ [itemID] =
+-- count in the bank }, or nil when the client cannot count that either - a mat left out of the table is unknown
+-- too, never guessed as 0) -> one row per mat: how many are in the bags, how many in the bank, how many are still
+-- to buy (bags and bank both taken off, never below 0), and whether the bags ALONE already hold enough (the bank
+-- column is read-only information; the green "enough" mark stays the bags promise it always was, 0.12.1).
+function L.shoppingRows(list, have, bank)
     local rows = {}
     for i = 1, #list.mats do
         local m = list.mats[i]
         local count = nil
         if type(have) == "table" then count = isCount(have[m.itemID], 0) and have[m.itemID] or 0 end
-        local buy = m.need - (count or 0)
+        local bankCount = nil
+        if type(bank) == "table" and isCount(bank[m.itemID], 0) then bankCount = bank[m.itemID] end
+        local buy = m.need - (count or 0) - (bankCount or 0)
         if buy < 0 then buy = 0 end
-        rows[i] = { itemID = m.itemID, name = m.name, need = m.need, have = count, buy = buy,
+        rows[i] = { itemID = m.itemID, name = m.name, need = m.need, have = count, bank = bankCount, buy = buy,
             enough = count ~= nil and count >= m.need, each = m.each, payUpTo = m.payUpTo, vendor = m.vendor }
     end
     return rows
