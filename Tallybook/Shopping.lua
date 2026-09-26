@@ -16,6 +16,12 @@
 -- never buys, posts or cancels. It shows itself when the house opens - showing is not asking the house for
 -- anything - and the Close button hides it until the next visit; /tally shopping brings it back. Every widget is
 -- built under pcall: a client that cannot build it gets no panel, and the list stays readable in /tally shopping.
+--
+-- Done (0.15.2, "Clear the shopping list"): unlike Close, it hides the panel for the rest of the SESSION - every
+-- later AUCTION_HOUSE_SHOW stays quiet for this exact list, by identity (recipe id + sent-at), until Data.lua
+-- carries a different one - and records that identity (Logic.noteShoppingDone) so the next upload's reference
+-- document tells the server to clear THAT list, never a newer one sent since. /tally shopping still forces it
+-- open by hand, Done or not.
 
 local _, ns = ...
 local Logic = ns.Logic
@@ -42,6 +48,16 @@ local GREEN, RED, CLOSE = "|cff00ff00", "|cffff2020", "|r"
 local panel, cannotBuild
 -- Closed with its button during THIS visit to the house; the next AUCTION_HOUSE_SHOW shows it again.
 local closedThisVisit = false
+-- The Done button (0.15.2): the identity ({ recipeID, at }) of whichever list was marked done this SESSION -
+-- unlike Close, this stays hidden across every later AUCTION_HOUSE_SHOW, until Data.lua carries a different
+-- list (a different recipeID or at). /tally shopping still forces it open (Shopping.command's own `force`).
+local doneList = nil
+
+-- Whether `list` is the exact one Done was pressed on - never a newer one sent since, which carries a
+-- different `at`.
+local function isDone(list)
+    return doneList ~= nil and list ~= nil and doneList.recipeID == list.recipeID and doneList.at == list.at
+end
 
 local function window()
     if type(AuctionHouseFrame) == "table" then return AuctionHouseFrame end
@@ -206,6 +222,27 @@ local function build(parent)
     end))
     p.closeButton = close
 
+    -- Done (0.15.2): the list just used, marked finished - hidden for the rest of the SESSION (not just this
+    -- visit, like Close), and its identity recorded so the next upload tells the server to clear THAT list.
+    local okDone, done = pcall(CreateFrame, "Button", nil, p, "UIPanelButtonTemplate")
+    if not okDone then
+        done = CreateFrame("Button", nil, p)
+        done.label = newLabel(done, "GameFontNormal", "CENTER")
+        done.label:SetAllPoints()
+        done.label:SetText("Done")
+    end
+    done:SetSize(50, 22)
+    done:SetPoint("TOPRIGHT", close, "TOPLEFT", -2, 0)
+    if done.SetText then done:SetText("Done") end
+    done:SetScript("OnClick", guarded(function()
+        local list = currentList()
+        if not list then return end
+        doneList = { recipeID = list.recipeID, at = list.at }
+        Logic.noteShoppingDone(ns.db(), list)
+        p:Hide()
+    end))
+    p.doneButton = done
+
     p.headers = {}
     for c = 1, #COLUMNS do
         local header = newLabel(p, "GameFontDisableSmall", COLUMNS[c][5])
@@ -290,10 +327,11 @@ local function attach()
     return panel
 end
 
--- Shows the list if there is one. -> true when it is on screen.
-local function show()
+-- Shows the list if there is one - unless it is the exact one Done was pressed on this session, and `force`
+-- is not set (/tally shopping's own override). -> true when it is on screen.
+local function show(force)
     local list = currentList()
-    if not list or not attach() then return false end
+    if not list or (not force and isDone(list)) or not attach() then return false end
     paint(list)
     panel:Show()
     return true
@@ -314,7 +352,7 @@ function Shopping.command()
         return
     end
     closedThisVisit = false
-    if not show() then
+    if not show(true) then
         -- No panel on this client: the list in chat instead, one mat a line.
         ns.print(Logic.shoppingHeading(list, ns.serverTime()))
         local rows = Logic.shoppingRows(list, bags(list), bank(list))

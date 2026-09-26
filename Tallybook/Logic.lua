@@ -9,7 +9,7 @@ ns = ns or {}
 local L = {}
 ns.Logic = L
 
-L.VERSION = "0.15.1"
+L.VERSION = "0.15.2"
 -- Two independent version counters, mirroring the server (src/shared/scan-schema.ts SCAN_SCHEMA_VERSION,
 -- src/shared/ref-doc.ts REF_SCHEMA_VERSION): the scan document's shape (replicate, browse) has not changed
 -- since M1, so buildDoc still tags SCAN_SCHEMA; the reference document gained items, suffixes and named
@@ -1072,6 +1072,19 @@ local function sortedKeys(tbl)
     return keys
 end
 
+-- The Shopping panel's Done button (addon 0.15.2): records which list just finished, by identity - the
+-- recipe id and the list's own `at` (its sent-at stamp, straight from Data.lua's shopping table) - so the
+-- next document tells the server exactly which list to clear, and never a newer one sent since (the server's
+-- own WHERE clause matches both fields exactly; ref-doc.ts's ShoppingDone is the contract). One record per
+-- session: a second Done, for a different list, simply replaces the first - there is only ever one panel
+-- showing at a time. -> true when recorded.
+function L.noteShoppingDone(db, list)
+    if type(db) ~= "table" then return false end
+    if type(list) ~= "table" or not isCount(list.recipeID, 1) or not isCount(list.at, 0) then return false end
+    db.doneShopping = { recipeID = list.recipeID, at = list.at }
+    return true
+end
+
 -- -> { schema, kind = "ref", at, addon, vendor = { {itemID, price}, ... }, recipes = { {outputItemID,
 -- recipeID, qty, { {itemID, qty}, ... }, name, profession, skillLine}, ... }, items = { {itemID, name,
 -- quality}, ... }, suffixes = { {itemID, suffixID, name}, ... } }, all sorted; nil when there is nothing
@@ -1206,8 +1219,15 @@ function L.refDoc(db, at)
         hasSettings = true
         break
     end
+    -- The Shopping panel's Done button (see L.noteShoppingDone above): [recipeID, at] exactly as
+    -- ref-doc.ts's ShoppingDone expects, or nil when nothing has been marked done this session.
+    local shoppingDone = nil
+    if type(db.doneShopping) == "table" and isCount(db.doneShopping.recipeID, 1)
+        and isCount(db.doneShopping.at, 0) then
+        shoppingDone = { db.doneShopping.recipeID, db.doneShopping.at }
+    end
     if #vendor == 0 and #recipes == 0 and #variants == 0 and #items == 0 and #suffixes == 0
-        and #sales == 0 and #known == 0 and not hasSettings then
+        and #sales == 0 and #known == 0 and not hasSettings and not shoppingDone then
         return nil
     end
     local doc = { schema = L.SCHEMA, kind = "ref", at = countOr0(at), addon = L.VERSION, vendor = vendor, recipes = recipes }
@@ -1217,6 +1237,7 @@ function L.refDoc(db, at)
     if #suffixes > 0 then doc.suffixes = suffixes end
     if #sales > 0 then doc.sales = sales end
     if #known > 0 then doc.known = known end
+    if shoppingDone then doc.shoppingDone = shoppingDone end
     return doc
 end
 
