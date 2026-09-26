@@ -9,7 +9,7 @@ ns = ns or {}
 local L = {}
 ns.Logic = L
 
-L.VERSION = "0.13.0"
+L.VERSION = "0.14.0"
 -- Two independent version counters, mirroring the server (src/shared/scan-schema.ts SCAN_SCHEMA_VERSION,
 -- src/shared/ref-doc.ts REF_SCHEMA_VERSION): the scan document's shape (replicate, browse) has not changed
 -- since M1, so buildDoc still tags SCAN_SCHEMA; the reference document gained items, suffixes and named
@@ -841,16 +841,24 @@ end
 -- The profit summary of a whole profession (Summary.lua): the tooltip's numbers, one row per recipe.
 ---------------------------------------------------------------------------------------------------
 
--- recipeIDs: the open profession's recipes, in the game's order. index, outputs: from recipeIndex.
--- -> rows { recipeID, itemID, qty, cost, missing, sale, profit, status = "profit" | "loss" | "unknown",
---          why = "mats" | "nosale" }, counts { profit, loss, unknown }
+-- recipeIDs: the open profession's recipes, in the game's order. index, outputs: from recipeIndex. bound (2026-09-25,
+-- "Cannot Sell") is optional: { [itemID] = true } for an output the client says binds on pickup - read live off
+-- GetItemInfo's own bindType (feature-detected in Summary.lua, never here: this file touches no client API), so
+-- the caller decides what "bound" means and this function only ever reads the table it is handed.
+-- -> rows { recipeID, itemID, qty, cost, missing, sale, profit, status = "profit" | "loss" | "unknown" | "bop",
+--          why = "mats" | "nosale" }, counts { profit, loss, unknown, bop }
 -- sale is what the recipe makes at the cheapest listing, before the cut; profit is after it. Breaking even is
 -- a profit. A recipe never read, or one that makes no item, is left out: there is nothing honest to say.
 -- market (M3) is the server's market value per unit, from the data file. When it has a figure for the item
 -- that is what a craft sells for, and the profit follows from it; otherwise today's cheapest listing stands
 -- in and the row says so (row.saleFrom = "now"), because the two are not the same claim.
-function L.profitSummary(recipeIDs, index, outputs, prices, vendor, listed, market)
-    local rows, counts = {}, { profit = 0, loss = 0, unknown = 0 }
+--
+-- A "bop" row carries cost (still real: crafting it still costs mats) but no sale, profit or saleFrom - it can
+-- never be sold, so there is nothing honest to compute there. sortSummary below gives `status == "bop"` an
+-- explicit tie-break under the "profit" key, ahead of even an "unknown" row (which likewise has no `profit`
+-- but is not, itself, unsellable) - not merely "nil sorts last", which would only tie the two together.
+function L.profitSummary(recipeIDs, index, outputs, prices, vendor, listed, market, bound)
+    local rows, counts = {}, { profit = 0, loss = 0, unknown = 0, bop = 0 }
     if type(recipeIDs) ~= "table" or type(index) ~= "table" or type(outputs) ~= "table" then return rows, counts end
     for i = 1, #recipeIDs do
         local recipeID = recipeIDs[i]
@@ -860,17 +868,21 @@ function L.profitSummary(recipeIDs, index, outputs, prices, vendor, listed, mark
             local qty = isCount(entry.qty, 1) and entry.qty or 1
             local row = { recipeID = recipeID, itemID = itemID, qty = qty, cost = cost, missing = missing }
             if type(listed) == "table" and isCount(listed[itemID], 0) then row.listed = listed[itemID] end
-            local price, from = type(market) == "table" and market[itemID] or nil, "market"
-            if not isCount(price, 1) then
-                price, from = type(prices) == "table" and prices[itemID] or nil, "now"
-            end
-            local profit = L.craftingProfit(cost, missing, qty, price)
-            if profit then
-                row.sale, row.profit, row.saleFrom = price * qty, profit, from
-                row.status = profit >= 0 and "profit" or "loss"
+            if type(bound) == "table" and bound[itemID] then
+                row.status = "bop"
             else
-                row.status = "unknown"
-                row.why = missing > 0 and "mats" or "nosale"
+                local price, from = type(market) == "table" and market[itemID] or nil, "market"
+                if not isCount(price, 1) then
+                    price, from = type(prices) == "table" and prices[itemID] or nil, "now"
+                end
+                local profit = L.craftingProfit(cost, missing, qty, price)
+                if profit then
+                    row.sale, row.profit, row.saleFrom = price * qty, profit, from
+                    row.status = profit >= 0 and "profit" or "loss"
+                else
+                    row.status = "unknown"
+                    row.why = missing > 0 and "mats" or "nosale"
+                end
             end
             counts[row.status] = counts[row.status] + 1
             rows[#rows + 1] = row
@@ -883,9 +895,15 @@ local SORT_KEYS = { profit = "number", cost = "number", sale = "number", listed 
 
 -- Sorts in place and returns rows. A row with nothing under this key goes last in either direction; ties
 -- keep recipe order, so the list never shuffles between refreshes. An unknown key leaves the order alone.
+--
+-- "Cannot Sell" (2026-09-25): under the "profit" key specifically, a "bop" row sorts after EVERY other row,
+-- unknown ones included, in either direction - literally last, not merely tied for last on having no
+-- `profit` field (which an "unknown" row also lacks). Checked before `value` is even read, so it costs
+-- nothing for every other key, where a bop row sorts by its real cost/sale/name exactly like any other row.
 function L.sortSummary(rows, key, descending)
     if type(rows) ~= "table" or not SORT_KEYS[key] then return rows end
     local kind = SORT_KEYS[key]
+    local bopLast = key == "profit"
     local function value(row)
         local v = row[key]
         if type(v) ~= kind then return nil end
@@ -893,6 +911,10 @@ function L.sortSummary(rows, key, descending)
         return v
     end
     table.sort(rows, function(a, b)
+        if bopLast then
+            local aBop, bBop = a.status == "bop", b.status == "bop"
+            if aBop ~= bBop then return not aBop end
+        end
         local va, vb = value(a), value(b)
         if va ~= vb then
             if va == nil then return false end

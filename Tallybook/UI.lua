@@ -130,6 +130,31 @@ local function itemName(itemID)
 end
 UI.itemName = itemName
 
+-- "Cannot Sell" (2026-09-25, owner-approved): whether the client currently knows this item binds ON PICKUP -
+-- true, false for anything else it knows, nil when the client hasn't cached this item's info yet (so the
+-- caller should treat it as unknown and show the ordinary figure, never a false "sellable"). Feature-detected,
+-- the same pattern Scan.lua's own base-name read already uses: C_Item.GetItemInfo where the client has it,
+-- else the classic global GetItemInfo Forever's client still exposes. Both return the same 17 values in the
+-- same order; the 14th is bindType, and Blizzard's own enum for "binds when picked up" is 1.
+local BIND_ON_PICKUP = 1
+function UI.bindsOnPickup(itemID)
+    if ns.isSecret(itemID) or type(itemID) ~= "number" then return nil end
+    local fn
+    if type(C_Item) == "table" and type(C_Item.GetItemInfo) == "function" then
+        fn = C_Item.GetItemInfo
+    elseif type(GetItemInfo) == "function" then
+        fn = GetItemInfo
+    else
+        return nil
+    end
+    -- select(14, ...) rather than a run of placeholder locals before pcall's own `ok`, which is exactly the
+    -- kind of position that is trivial to miscount by one and get no error for, only a silently wrong item
+    -- (caught in review: an earlier version of this line landed on subclassID, one short of bindType).
+    local ok, bindType = pcall(function() return (select(14, fn(itemID))) end)
+    if not ok or ns.isSecret(bindType) or type(bindType) ~= "number" then return nil end
+    return bindType == BIND_ON_PICKUP
+end
+
 -- -> "Craft cost: <total> (<one> each) + N mats with no price", then "Profit: <n>" / "Profit: -<n>" or nil, then
 -- the chosen recipe's mats as { {left, right}, ... }; nil when no recipe makes this item
 function UI.craftLine(itemID)
@@ -154,16 +179,24 @@ function UI.craftLine(itemID)
     if each ~= total then line = line .. " (" .. money(each) .. " each)" end
     if missing > 0 then line = line .. " + " .. unpriced(missing) end
 
-    -- M3, fix round 1: what one sells for is the server's market value when there is one, today's cheapest
-    -- listing when there is not - the same order Logic.profitSummary uses for the Profit panel. Hovering a
-    -- row of that panel shows this tooltip, so the two must never quote different profits for one recipe.
+    -- "Cannot Sell" (2026-09-25): it never sells, whatever the numbers would say, so there is nothing to
+    -- compute - checked before market/prices are even read. A client that hasn't cached this item yet
+    -- (bindsOnPickup returns nil) is treated as unknown, exactly like any other missing fact here: the
+    -- ordinary profit line shows, not a false claim either way.
     local result
-    local market = type(db.market) == "table" and db.market[itemID] or nil
-    local price = (type(market) == "number" and market > 0) and market
-        or (type(db.prices) == "table" and db.prices[itemID] or nil)
-    local profit = Logic.craftingProfit(total, missing, recipe.qty, price)
-    if profit then
-        result = (profit >= 0 and (PROFIT .. money(profit)) or (LOSS .. money(-profit))) .. CLOSE
+    if UI.bindsOnPickup(itemID) then
+        result = DIM .. "Cannot sell" .. CLOSE
+    else
+        -- M3, fix round 1: what one sells for is the server's market value when there is one, today's cheapest
+        -- listing when there is not - the same order Logic.profitSummary uses for the Profit panel. Hovering a
+        -- row of that panel shows this tooltip, so the two must never quote different profits for one recipe.
+        local market = type(db.market) == "table" and db.market[itemID] or nil
+        local price = (type(market) == "number" and market > 0) and market
+            or (type(db.prices) == "table" and db.prices[itemID] or nil)
+        local profit = Logic.craftingProfit(total, missing, recipe.qty, price)
+        if profit then
+            result = (profit >= 0 and (PROFIT .. money(profit)) or (LOSS .. money(-profit))) .. CLOSE
+        end
     end
     return line, result, mats
 end

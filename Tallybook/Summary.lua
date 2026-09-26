@@ -94,7 +94,9 @@ local function plural(n, one, many)
 end
 
 local function countsText()
-    return string.format("%.0f profitable, %.0f at a loss, %.0f unknown", counts.profit, counts.loss, counts.unknown)
+    local text = string.format("%.0f profitable, %.0f at a loss, %.0f unknown", counts.profit, counts.loss, counts.unknown)
+    if (counts.bop or 0) > 0 then text = text .. string.format(", %.0f bind on pickup", counts.bop) end
+    return text
 end
 
 ---------------------------------------------------------------------------------------------------
@@ -104,7 +106,7 @@ end
 -- The open profession's recipes -> current (filtered, named, sorted) and counts (before "hide unknown").
 local function compute()
     choices()
-    current, counts = {}, { profit = 0, loss = 0, unknown = 0 }
+    current, counts = {}, { profit = 0, loss = 0, unknown = 0, bop = 0 }
     local T, db = C_TradeSkillUI, TallybookDB
     if type(T) ~= "table" or type(T.GetAllRecipeIDs) ~= "function" or type(db) ~= "table" then return end
     local ok, ids = pcall(T.GetAllRecipeIDs)
@@ -127,8 +129,16 @@ local function compute()
     end
 
     local index, outputs = Logic.recipeIndex(db.recipes)
+    -- "Cannot Sell" (2026-09-25): which output items the client currently knows bind on pickup - read live,
+    -- once per distinct item id (several recipes can share an output), feature-detected in UI.bindsOnPickup.
+    -- Logic.lua itself never touches this: it only ever reads the table this file hands it.
+    local bound = {}
+    for i = 1, #wanted do
+        local itemID = outputs[wanted[i]]
+        if itemID and bound[itemID] == nil and ns.UI.bindsOnPickup(itemID) then bound[itemID] = true end
+    end
     local rows
-    rows, counts = Logic.profitSummary(wanted, index, outputs, db.prices, db.vendor, db.listed, db.market)
+    rows, counts = Logic.profitSummary(wanted, index, outputs, db.prices, db.vendor, db.listed, db.market, bound)
     for i = 1, #rows do
         local row = rows[i]
         row.name = names[row.recipeID] or ns.UI.itemName(row.itemID)
@@ -154,6 +164,7 @@ end
 local function resultText(row)
     if row.status == "profit" then return GREEN .. "+" .. ns.UI.money(row.profit) .. CLOSE end
     if row.status == "loss" then return RED .. "-" .. ns.UI.money(-row.profit) .. CLOSE end
+    if row.status == "bop" then return GREY .. "Cannot sell" .. CLOSE end -- 2026-09-25: binds on pickup
     if row.why == "mats" then return GREY .. plural(row.missing, "mat", "mats") .. " with no price" .. CLOSE end
     return GREY .. "nobody selling" .. CLOSE
 end

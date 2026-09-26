@@ -17,7 +17,7 @@ local PAD = 6        -- between the cost and the row's right edge, and between t
 local LABEL_LEFT = 36 -- where a recipe name starts when the row cannot say
 
 local hooked = false
-local GREEN, RED, CLOSE = "|cff00ff00", "|cffff2020", "|r"
+local GREEN, RED, GREY, CLOSE = "|cff00ff00", "|cffff2020", "|cff808080", "|r"
 local index, outputs -- recipeID -> recipe entry / output item; dropped whenever something new is learned
 
 local function scrollBox()
@@ -47,6 +47,11 @@ function List.costText(recipeID)
         return ns.UI.money(total) .. " +?"
     end
     local itemID = outputs[recipeID]
+    -- "Cannot Sell" (2026-09-25): only the "profit" list reads as a sale figure at all - "cost" already means
+    -- the crafting cost, untouched by whether the output can be sold, so it is left as it was.
+    if ns.settings().list ~= "cost" and itemID and ns.UI.bindsOnPickup(itemID) then
+        return GREY .. "Cannot sell" .. CLOSE
+    end
     -- M3, fix round 1: the server's market value where there is one, today's cheapest listing otherwise -
     -- the order Logic.profitSummary and UI.craftLine both use. This number and the Profit panel's are on
     -- screen together, off the same profession window, so they price the same recipe the same way.
