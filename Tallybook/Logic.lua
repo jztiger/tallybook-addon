@@ -9,7 +9,7 @@ ns = ns or {}
 local L = {}
 ns.Logic = L
 
-L.VERSION = "0.14.0"
+L.VERSION = "0.15.0"
 -- Two independent version counters, mirroring the server (src/shared/scan-schema.ts SCAN_SCHEMA_VERSION,
 -- src/shared/ref-doc.ts REF_SCHEMA_VERSION): the scan document's shape (replicate, browse) has not changed
 -- since M1, so buildDoc still tags SCAN_SCHEMA; the reference document gained items, suffixes and named
@@ -46,6 +46,12 @@ L.MAX_SALE_ROWS = 5000
 -- src/shared/ref-doc.ts, the server-side backstop for the same two caps.
 L.MAX_BONUS_LINES = 8
 L.MAX_BONUS_LINE_CHARS = 64
+-- Phase 6 (the learned flag, addon 0.15.0): which recipes each of the player's OWN characters knows, plus
+-- that profession's skill rank - keyed by a hashed character id, never a name (see L.charHash). Mirrors
+-- MAX_KNOWN_ROWS / MAX_KNOWN_RECIPE_IDS in src/shared/ref-doc.ts: one row per (character, profession) this
+-- session actually read, each carrying at most this many recipe ids.
+L.MAX_KNOWN_ROWS = 64
+L.MAX_KNOWN_RECIPE_IDS = 2000
 local OUTCOMES = { sold = true, returned = true }
 
 -- The server refuses any number that is not a safe integer (2^53 - 1).
@@ -138,6 +144,47 @@ end
 -- inside Lua 5.1.
 function L.rand31()
     return math.random(0, 65535) * 32768 + math.random(0, 32767)
+end
+
+---------------------------------------------------------------------------------------------------
+-- Character identity, for the learned flag (Phase 6). Never a name: see L.charHash below.
+---------------------------------------------------------------------------------------------------
+
+-- Two independent 32-bit polynomial hashes of a string, combined by hex8 into 16 lowercase hex
+-- characters. No XOR, no bit library - the game's Lua 5.1 has neither - and plain multiplication/mod stay
+-- exact well under a double's 2^53 integer precision (the biggest product here is a byte times a small
+-- multiplier). Two different (multiplier, modulus) pairs, not one hash read twice, so the two halves do
+-- not just repeat each other.
+local HASH_MOD_A = 4294967296 -- 2^32
+local HASH_MOD_B = 4294967291 -- the largest prime below 2^32
+local function polyHash(s, k, mod)
+    local h = 0
+    for i = 1, #s do
+        h = (h * k + string.byte(s, i)) % mod
+    end
+    return h
+end
+
+-- A stable fingerprint of a string: not reversible in any practical sense, but not a cryptographic hash
+-- either - it does not need to be, since what it hashes (see L.charHash) is never secret, only never sent
+-- whole. -> 16 lowercase hex characters, or nil for anything that is not a non-empty string.
+local function fingerprint(s)
+    if type(s) ~= "string" or s == "" then return nil end
+    return hex8(polyHash(s, 31, HASH_MOD_A)) .. hex8(polyHash(s, 131, HASH_MOD_B))
+end
+
+-- Tells one of the player's characters apart from another - on this account or any other - without ever
+-- uploading anything that reads back as a name. `UnitGUID("player")` (e.g. "Player-4646-000156C8") is
+-- realm- and character-scoped and stable for that character's whole life, unlike its name, which can be
+-- changed or reused; hashing it, rather than sending it whole, means the raw GUID (which some third-party
+-- tools resolve to a name via the armory) never leaves the client either. Deliberately NOT salted: saved
+-- state does not survive a client restart (CLAUDE.md), so a salt would make every session a "new" character
+-- and the whole point of this - "you already knew this recipe last week" - would never hold still.
+-- isUid(v) below is the same 16-lowercase-hex-character shape a fingerprint always produces, so callers
+-- that need to validate one already have it. -> 16 lowercase hex characters, or nil when the client gave no
+-- usable GUID (the caller sends no known-recipes section at all rather than guess an identity).
+function L.charHash(guid)
+    return fingerprint(guid)
 end
 
 ---------------------------------------------------------------------------------------------------
@@ -492,6 +539,10 @@ function L.initDB(db)
     if type(db.settings) ~= "table" then db.settings = {} end
     if type(db.items) ~= "table" then db.items = {} end
     if type(db.suffixes) ~= "table" then db.suffixes = {} end
+    -- Phase 6: which recipes a character knows and that profession's skill rank, keyed by "charHash:skillLine"
+    -- (see L.noteKnownRecipe) - a session only ever has one character, but keying on both keeps two
+    -- professions on the same character apart, same as db.suffixes keys on "itemID:suffixID".
+    if type(db.known) ~= "table" then db.known = {} end
     -- M3: the player's own sales and returns, keyed by the dedup key (see L.noteSale), and the two figures
     -- the server works out and hands back in Data.lua: market value per unit, and sales per day x100.
     if type(db.sales) ~= "table" then db.sales = {} end
@@ -727,6 +778,34 @@ function L.noteSale(db, itemID, itemName, count, price, deposit, cut, outcome, e
     db.sales[key] = { itemID, itemName, count, price, deposit, cut, outcome, expiresAt }
     if isDaysLeft(daysLeft) then db.sales[key][9] = daysLeft end
     db.saleCount = db.saleCount + 1
+    return true
+end
+
+-- One recipe THIS character actually knows (Phase 6), from the profession window they have open. charHash
+-- is L.charHash's 16-hex-character fingerprint; skillLine is the same id space as recipe.skill_line
+-- (recipeProfession's own resolved id, Craft.lua); skillRank/maxSkillRank are the profession's current and
+-- cap skill level, read once per window opening the same way skillLine's window fallback is (0.9.2's
+-- stale-window lesson). A second call for a recipe already recorded under the same (charHash, skillLine) is
+-- a no-op - the set does not grow just because the window was read twice - but profession/skillRank/
+-- maxSkillRank are refreshed every time, since skilling up mid-session is exactly the case this exists to
+-- catch. -> true when this recipe id was newly added to the set.
+function L.noteKnownRecipe(db, charHash, profession, skillLine, skillRank, maxSkillRank, recipeID)
+    if type(db) ~= "table" or type(db.known) ~= "table" then return false end
+    if not isUid(charHash) or not validName(profession) then return false end
+    if not isCount(skillLine, 1) or not isCount(recipeID, 1) then return false end
+    if not isCount(skillRank, 0) or not isCount(maxSkillRank, 0) then return false end
+    local key = charHash .. ":" .. skillLine
+    local entry = db.known[key]
+    if type(entry) ~= "table" then
+        if tableSize(db.known) >= L.MAX_KNOWN_ROWS then return false end
+        entry = { charHash = charHash, skillLine = skillLine, recipes = {}, recipeCount = 0 }
+        db.known[key] = entry
+    end
+    entry.profession, entry.skillRank, entry.maxSkillRank = profession, skillRank, maxSkillRank
+    if entry.recipes[recipeID] then return false end
+    if entry.recipeCount >= L.MAX_KNOWN_RECIPE_IDS then return false end
+    entry.recipes[recipeID] = true
+    entry.recipeCount = entry.recipeCount + 1
     return true
 end
 
@@ -1085,6 +1164,28 @@ function L.refDoc(db, at)
             return a[4] < b[4]
         end)
     end
+    -- Phase 6: which recipes this session's character knows, and that profession's skill rank
+    -- (L.noteKnownRecipe). Sorted by charHash then skillLine NUMERICALLY (not by the "charHash:skillLine"
+    -- storage key as a string, which would sort skill line 165 before 5), so the same session always
+    -- produces the same document.
+    local known = {}
+    if type(db.known) == "table" then
+        for _, entry in pairs(db.known) do
+            if type(entry) == "table" and isUid(entry.charHash) and validName(entry.profession)
+                and isCount(entry.skillLine, 1) then
+                local ids = sortedKeys(entry.recipes)
+                if #ids > 0 then
+                    known[#known + 1] = { entry.charHash, entry.profession, entry.skillLine,
+                        isCount(entry.skillRank, 0) and entry.skillRank or 0,
+                        isCount(entry.maxSkillRank, 0) and entry.maxSkillRank or 0, ids }
+                end
+            end
+        end
+        table.sort(known, function(a, b)
+            if a[1] ~= b[1] then return a[1] < b[1] end
+            return a[3] < b[3]
+        end)
+    end
     local settings = cleanSettings(db.settings)
     local hasSettings = false
     for _ in pairs(settings) do
@@ -1092,7 +1193,7 @@ function L.refDoc(db, at)
         break
     end
     if #vendor == 0 and #recipes == 0 and #variants == 0 and #items == 0 and #suffixes == 0
-        and #sales == 0 and not hasSettings then
+        and #sales == 0 and #known == 0 and not hasSettings then
         return nil
     end
     local doc = { schema = L.SCHEMA, kind = "ref", at = countOr0(at), addon = L.VERSION, vendor = vendor, recipes = recipes }
@@ -1101,6 +1202,7 @@ function L.refDoc(db, at)
     if #items > 0 then doc.items = items end
     if #suffixes > 0 then doc.suffixes = suffixes end
     if #sales > 0 then doc.sales = sales end
+    if #known > 0 then doc.known = known end
     return doc
 end
 

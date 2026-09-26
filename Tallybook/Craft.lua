@@ -5,6 +5,11 @@
 --   * a vendor window     -> the unit price of everything sold for plain gold in unlimited supply
 -- What is learned lands in TallybookDB.recipes / TallybookDB.vendor; UI.lua turns it into the
 -- "Craft cost" tooltip line with Logic.cheapestRecipe. Nothing here touches the auction house.
+--
+-- Phase 6 (the learned flag, addon 0.15.0): the SAME profession-window read also notes which of those
+-- recipes this character actually knows (recipeLearned) and the profession's own skill rank, filed under a
+-- hashed character id (playerCharHash - never a name) into TallybookDB.known. Skipped whole for a window
+-- that is not the player's own (otherPlayersWindow: a chat link, a guild order, an NPC's crafting UI).
 
 local ADDON, ns = ...
 local Logic = ns.Logic
@@ -61,17 +66,66 @@ end
 -- Summary.lua:80. professionID is the TradeSkillLineID (Tailoring = 197, what recipe.skill_line means
 -- server-side) - a different number from the small `profession` enum field on the same table, which this
 -- does not read (0.9.2, confirmed against the live client). Guarded like every other client API here; 0
--- means unknown.
+-- means unknown. Phase 6 also reads this table's skillLevel / maxSkillLevel - the profession's current and
+-- cap skill rank - at the same safe moment (the end of the read) and for the same reason: mid-read it can
+-- still describe whichever profession was open a moment ago.
 local function professionInfo()
     local T = C_TradeSkillUI
-    if type(T) ~= "table" or type(T.GetBaseProfessionInfo) ~= "function" then return nil, 0 end
+    if type(T) ~= "table" or type(T.GetBaseProfessionInfo) ~= "function" then return nil, 0, 0, 0 end
     local ok, info = pcall(T.GetBaseProfessionInfo)
-    if not ok or ns.isSecret(info) or type(info) ~= "table" then return nil, 0 end
+    if not ok or ns.isSecret(info) or type(info) ~= "table" then return nil, 0, 0, 0 end
     local name = info.professionName
     if ns.isSecret(name) or type(name) ~= "string" or name == "" then name = nil end
     local id = info.professionID
     if ns.isSecret(id) or type(id) ~= "number" or id < 0 or id % 1 ~= 0 then id = 0 end
-    return name, id
+    local rank = info.skillLevel
+    if ns.isSecret(rank) or type(rank) ~= "number" or rank < 0 or rank % 1 ~= 0 then rank = 0 end
+    local maxRank = info.maxSkillLevel
+    if ns.isSecret(maxRank) or type(maxRank) ~= "number" or maxRank < 0 or maxRank % 1 ~= 0 then maxRank = 0 end
+    return name, id, rank, maxRank
+end
+
+-- Phase 6: the reading character's own identity, hashed - never a name (Logic.charHash's own comment says
+-- why). -> 16 lowercase hex characters, or nil when the client gives no GUID to hash.
+local function playerCharHash()
+    if type(UnitGUID) ~= "function" then return nil end
+    local ok, guid = pcall(UnitGUID, "player")
+    if not ok or ns.isSecret(guid) or type(guid) ~= "string" or guid == "" then return nil end
+    return Logic.charHash(guid)
+end
+
+-- True when the open profession window is not the player's OWN: a recipe link in chat, a guild crafting
+-- order, or an NPC's crafting UI (all feature-detected; a client with none of these calls is assumed to show
+-- the player's own window, same as every other read in this file - this only ever narrows the learned flag,
+-- never the ordinary recipe-cost learning above, which has always read whatever window is open). Checked
+-- before ANY known-recipe is recorded: without it, opening someone else's linked or guild window would claim
+-- their recipes and skill rank as the reader's own.
+local function otherPlayersWindow()
+    local T = C_TradeSkillUI
+    if type(T) ~= "table" then return false end
+    local checks = { "IsTradeSkillLinked", "IsTradeSkillGuild", "IsNPCCrafting" }
+    for i = 1, #checks do
+        local fn = T[checks[i]]
+        if type(fn) == "function" then
+            local ok, value = pcall(fn)
+            if ok and value == true then return true end
+        end
+    end
+    return false
+end
+
+-- Whether recipeID is one the reader actually knows (Phase 6), from the client's own recipe info - never
+-- assumed just because it appeared in GetAllRecipeIDs, which can list a recipe the window merely shows (an
+-- unlearned one, when its "show all" filter is on). -> true / false, or nil when the client cannot say
+-- (feature-detected); nil means "record nothing for this recipe", never "assume known".
+local function recipeLearned(recipeID)
+    local T = C_TradeSkillUI
+    if type(T) ~= "table" or type(T.GetRecipeInfo) ~= "function" then return nil end
+    local ok, info = pcall(T.GetRecipeInfo, recipeID)
+    if not ok or ns.isSecret(info) or type(info) ~= "table" then return nil end
+    local learned = info.learned
+    if ns.isSecret(learned) or type(learned) ~= "boolean" then return nil end
+    return learned
 end
 
 -- 0.9.2, live defect: a recipe's OWN trade skill line, when the client can say one, wins over whatever
@@ -157,6 +211,15 @@ function Craft.learnRecipes()
     local pending = {}
     reading = true
 
+    -- Phase 6 (the learned flag): read once, before anything else, exactly like every other per-run decision
+    -- here. charHash is nil when the client gave no GUID; recordKnown is also false for a linked, guild or
+    -- NPC window (otherPlayersWindow) - either way nothing below records a single known recipe, though the
+    -- ordinary recipe-cost learning above is unaffected. { recipeID =, skillLine = }, one per recipe this run
+    -- actually knows (recipeLearned), filed once the read (and any pending resolution) is done.
+    local charHash = playerCharHash()
+    local recordKnown = charHash ~= nil and not otherPlayersWindow()
+    local learnedThisRun = {}
+
     -- Files every still-pending recipe once the read is done: tiers 3 (the window's own professionID,
     -- read now for the reason 0.9.2 gives above) then 4 (the entry's own tradeSkillID) of the precedence on
     -- recipeProfession, applied only to the id - a recipe's own name (entry's profName) always wins over
@@ -173,6 +236,9 @@ function Craft.learnRecipes()
             if skillLine <= 0 and type(entry[8]) == "number" and entry[8] > 0 then skillLine = entry[8] end
             if Logic.addRecipe(db.recipes, entry[1], entry[2], entry[3], entry[4], entry[5], profName, skillLine) then
                 added = added + entry[6]
+                if recordKnown and recipeLearned(entry[2]) then
+                    learnedThisRun[#learnedThisRun + 1] = { recipeID = entry[2], skillLine = skillLine }
+                end
             end
         end
         pending = {}
@@ -192,6 +258,9 @@ function Craft.learnRecipes()
                     if profName and skillLine then
                         if Logic.addRecipe(db.recipes, outputItemID, recipeID, made, mats, name, profName, skillLine) then
                             added = added + fresh
+                            if recordKnown and recipeLearned(recipeID) then
+                                learnedThisRun[#learnedThisRun + 1] = { recipeID = recipeID, skillLine = skillLine }
+                            end
                         end
                     else
                         pending[#pending + 1] = { outputItemID, recipeID, made, mats, name, fresh, profName, tradeSkillID }
@@ -204,6 +273,22 @@ function Craft.learnRecipes()
             return
         end
         flushPending()
+        -- Phase 6: the profession's own current/cap skill rank, read once, now that the read (and any
+        -- pending resolution) is fully done - the same safe moment flushPending itself reads the window at.
+        -- Only recipes this run resolved to THIS window's own skillLine are recorded: one whose tier 1/2
+        -- resolution (recipeProfession, 0.9.3) disagreed with the window is the rare case that comment
+        -- describes, and this has no trustworthy rank to file it under, so it is simply left out this run.
+        if recordKnown and #learnedThisRun > 0 then
+            local windowName, windowID, skillRank, maxSkillRank = professionInfo()
+            if windowID > 0 and windowName then
+                for k = 1, #learnedThisRun do
+                    local row = learnedThisRun[k]
+                    if row.skillLine == windowID then
+                        Logic.noteKnownRecipe(db, charHash, windowName, windowID, skillRank, maxSkillRank, row.recipeID)
+                    end
+                end
+            end
+        end
         reading = false
         ns.changed()
         if added > 0 then
