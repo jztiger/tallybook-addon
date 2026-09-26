@@ -582,11 +582,50 @@ local function namesKnown(db, key)
     return type(db.suffixes) == "table" and db.suffixes[key.itemID .. ":" .. key.itemSuffix] ~= nil
 end
 
+-- Roll briefs, section B (addon 0.13.0): which (itemID, suffixID) keys this Lua session has already tried a
+-- tooltip read for - marked even on a miss, so a roll with no green lines (or no tooltip API at all) is
+-- never asked again. A plain Lua local, not saved data: a session here means this running client, the same
+-- lifetime every other in-memory scan table in this file already has, and SavedVariables could not hold a
+-- throttle like this honestly anyway (write-only, C7's own rule).
+local bonusAttempted = {}
+
+-- Reads one suffixed roll's own tooltip via C_TooltipInfo.GetItemKey - the SAME key a browse result already
+-- carries, so no item link is needed. Feature-detected: a client with no such function (or a Forever build
+-- that changes its shape) simply teaches nothing here, same as any other optional API this addon reads.
+-- Only the green bonus-stat lines are kept (Logic.filterBonusLines), and only ever beside a suffix row that
+-- already has its name (Logic.noteSuffixBonus's own guard) - never a player name, never on a timer.
+local function noteBonusLines(db, key)
+    local mapKey = key.itemID .. ":" .. key.itemSuffix
+    if bonusAttempted[mapKey] then return end
+    bonusAttempted[mapKey] = true -- marked before the call: a throw or a miss is still one try spent
+    local getItemKey = type(C_TooltipInfo) == "table" and C_TooltipInfo.GetItemKey or nil
+    if type(getItemKey) ~= "function" or not isCountLike(key.itemLevel) then return end
+    local ok, data = pcall(getItemKey, key.itemID, key.itemLevel, key.itemSuffix)
+    if not ok or ns.isSecret(data) or type(data) ~= "table" or ns.isSecret(data.lines)
+        or type(data.lines) ~= "table" then
+        return
+    end
+    local raw = {}
+    for i = 1, #data.lines do
+        local line = data.lines[i]
+        if type(line) == "table" and not ns.isSecret(line.leftText) and type(line.leftText) == "string" then
+            local c = line.leftColor
+            local green = type(c) == "table" and not ns.isSecret(c.r) and not ns.isSecret(c.g)
+                and not ns.isSecret(c.b) and type(c.g) == "number" and type(c.r) == "number"
+                and type(c.b) == "number" and c.g > 0.5 and c.r < 0.5 and c.b < 0.5
+            if green then raw[#raw + 1] = line.leftText end
+        end
+    end
+    if #raw > 0 then Logic.noteSuffixBonus(db, key.itemID, key.itemSuffix, raw) end
+end
+
 -- M2 (Ruling A/B): for each result's itemKey, GetItemKeyInfo answers itemName and quality once the client
 -- has cached the key - or nil until ITEM_KEY_ITEM_INFO_RECEIVED, in which case this result is skipped and
 -- a later scan sees it (no new event handler for this). itemSuffix 0 IS the base item: straight to
 -- noteItem. A non-zero itemSuffix is the FULL suffixed name, to noteSuffix; its base name is a separate,
 -- memoized lookup (the item template), because a suffixed key's own itemName is never the unsuffixed one.
+-- Roll briefs section B: a suffixed key whose bonus has not been tried this session still reaches
+-- noteBonusLines below even once its names are fully known - namesKnown alone would skip it for good.
 local function noteBrowseNames(results)
     local getKeyInfo = C_AuctionHouse.GetItemKeyInfo
     if type(getKeyInfo) ~= "function" then return end
@@ -594,20 +633,25 @@ local function noteBrowseNames(results)
     local baseName = memoize(templateName)
     for i = 1, #results do
         local key = results[i].itemKey
-        if type(key) == "table" and isCountLike(key.itemID) and isIntLike(key.itemSuffix)
-            and not namesKnown(db, key) then
-            local ok, info = pcall(getKeyInfo, key)
-            if ok and not ns.isSecret(info) and type(info) == "table"
-                and not (ns.isSecret(info.itemName) or ns.isSecret(info.quality)) then
-                if key.itemSuffix ~= 0 then
-                    if type(info.itemName) == "string" then
-                        Logic.noteSuffix(db, key.itemID, key.itemSuffix, info.itemName)
+        if type(key) == "table" and isCountLike(key.itemID) and isIntLike(key.itemSuffix) then
+            if not namesKnown(db, key) then
+                local ok, info = pcall(getKeyInfo, key)
+                if ok and not ns.isSecret(info) and type(info) == "table"
+                    and not (ns.isSecret(info.itemName) or ns.isSecret(info.quality)) then
+                    if key.itemSuffix ~= 0 then
+                        if type(info.itemName) == "string" then
+                            Logic.noteSuffix(db, key.itemID, key.itemSuffix, info.itemName)
+                        end
+                        local base = baseName(key.itemID)
+                        if base then Logic.noteItem(db, key.itemID, base, info.quality) end
+                    elseif type(info.itemName) == "string" then
+                        Logic.noteItem(db, key.itemID, info.itemName, info.quality)
                     end
-                    local base = baseName(key.itemID)
-                    if base then Logic.noteItem(db, key.itemID, base, info.quality) end
-                elseif type(info.itemName) == "string" then
-                    Logic.noteItem(db, key.itemID, info.itemName, info.quality)
                 end
+            end
+            if key.itemSuffix ~= 0 and type(db.suffixes) == "table"
+                and db.suffixes[key.itemID .. ":" .. key.itemSuffix] ~= nil then
+                noteBonusLines(db, key)
             end
         end
     end

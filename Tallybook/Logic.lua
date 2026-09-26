@@ -9,7 +9,7 @@ ns = ns or {}
 local L = {}
 ns.Logic = L
 
-L.VERSION = "0.12.1"
+L.VERSION = "0.13.0"
 -- Two independent version counters, mirroring the server (src/shared/scan-schema.ts SCAN_SCHEMA_VERSION,
 -- src/shared/ref-doc.ts REF_SCHEMA_VERSION): the scan document's shape (replicate, browse) has not changed
 -- since M1, so buildDoc still tags SCAN_SCHEMA; the reference document gained items, suffixes and named
@@ -41,6 +41,11 @@ L.MAX_NAME_CHARS = 128
 -- M3: the player's own auction outcomes, read from their own mailbox (spec 2026-09-24 section 4). Mirrors
 -- MAX_SALE_ROWS in src/shared/ref-doc.ts; one session's mailbox is never remotely this large.
 L.MAX_SALE_ROWS = 5000
+-- Roll briefs, section B (addon 0.13.0): a suffixed roll's own green bonus lines, read once per (item,
+-- suffix) per session from the item's tooltip. Mirrors MAX_BONUS_LINES / MAX_BONUS_LINE_CHARS in
+-- src/shared/ref-doc.ts, the server-side backstop for the same two caps.
+L.MAX_BONUS_LINES = 8
+L.MAX_BONUS_LINE_CHARS = 64
 local OUTCOMES = { sold = true, returned = true }
 
 -- The server refuses any number that is not a safe integer (2^53 - 1).
@@ -647,6 +652,46 @@ function L.noteSuffix(db, itemID, suffixID, fullName)
     return true
 end
 
+-- A random-enchant stat line ("+5 Agility", "-2 Spirit") or a green "Equip:" effect line - the two shapes
+-- Forever's own tooltip renders in the bonus-stat colour for a suffixed roll. Never a player name (no shape
+-- here matches "Crafted by ..." or a unit name), which is the one thing this filter exists to keep out.
+local BONUS_STAT_PATTERN = "^[%+%-]%d+ %a[%a ]*$"
+local BONUS_EQUIP_PATTERN = "^Equip: .+$"
+
+-- Raw tooltip lines (any shape, any source) -> only the ones worth keeping, each 1..MAX_BONUS_LINE_CHARS
+-- bytes, at most MAX_BONUS_LINES of them, in the order given. Pure and total: never errors on odd input,
+-- so Scan.lua can hand it whatever a tooltip API returned without checking it first.
+function L.filterBonusLines(rawLines)
+    local out = {}
+    if type(rawLines) ~= "table" then return out end
+    for i = 1, #rawLines do
+        local line = rawLines[i]
+        if type(line) == "string" and #line >= 1 and #line <= L.MAX_BONUS_LINE_CHARS
+            and (string.match(line, BONUS_STAT_PATTERN) or string.match(line, BONUS_EQUIP_PATTERN)) then
+            out[#out + 1] = line
+            if #out >= L.MAX_BONUS_LINES then break end
+        end
+    end
+    return out
+end
+
+-- Attaches a roll's own bonus lines (roll briefs section B) to the suffix row L.noteSuffix already wrote.
+-- Only ever fills in beside a name already on record - Scan.lua reads a tooltip for a key only once that
+-- key's own suffix row exists this session - so a row with bonus lines but no name can never reach buildRef.
+-- filterBonusLines is applied here too (not just trusted from the caller), so this stays safe called with
+-- anything. -> true when a bonus was recorded (never overwrites one already there: the first read this
+-- session wins, exactly once per (itemID, suffixID) - Scan.lua's own throttle, this is the belt).
+function L.noteSuffixBonus(db, itemID, suffixID, rawLines)
+    if type(db) ~= "table" or type(db.suffixes) ~= "table" then return false end
+    if not isCount(itemID, 1) or not isInt(suffixID) or suffixID == 0 then return false end
+    local entry = db.suffixes[itemID .. ":" .. suffixID]
+    if type(entry) ~= "table" or entry[4] ~= nil then return false end
+    local lines = L.filterBonusLines(rawLines)
+    if #lines == 0 then return false end
+    entry[4] = lines
+    return true
+end
+
 -- One of the player's OWN auction outcomes, read out of their own mailbox (M3, spec 2026-09-24 section 4).
 -- Mail.lua does the reading; this is the bookkeeping, and knows nothing about the client.
 --
@@ -975,12 +1020,18 @@ function L.refDoc(db, at)
     end
     -- Suffix full names (M2), stored under a composite "itemID:suffixID" key; sorted by the (itemID,
     -- suffixID) the row itself carries rather than that string, so item 10's suffixes do not sort before
-    -- item 2's.
+    -- item 2's. A 4th element (roll briefs section B) is that roll's own bonus lines, filtered again here
+    -- (L.noteSuffixBonus already filtered them, but this is the one place the document is actually built,
+    -- same as every other field on this row) and left off the row entirely when there are none - an absent
+    -- 4th element, not an empty array, so a v0.12 server sees exactly the 3-tuple it already knows.
     local suffixes = {}
     if type(db.suffixes) == "table" then
         for _, s in pairs(db.suffixes) do
             if type(s) == "table" and isCount(s[1], 1) and isInt(s[2]) and s[2] ~= 0 and validName(s[3]) then
-                suffixes[#suffixes + 1] = { s[1], s[2], s[3] }
+                local row = { s[1], s[2], s[3] }
+                local bonus = L.filterBonusLines(s[4])
+                if #bonus > 0 then row[4] = bonus end
+                suffixes[#suffixes + 1] = row
             end
         end
         table.sort(suffixes, function(a, b)
