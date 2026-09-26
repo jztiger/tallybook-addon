@@ -234,7 +234,8 @@ function Craft.learnRecipes()
             local profName = entry[7] or windowName
             local skillLine = windowID
             if skillLine <= 0 and type(entry[8]) == "number" and entry[8] > 0 then skillLine = entry[8] end
-            if Logic.addRecipe(db.recipes, entry[1], entry[2], entry[3], entry[4], entry[5], profName, skillLine) then
+            if Logic.addRecipe(db.recipes, entry[1], entry[2], entry[3], entry[4], entry[5], profName, skillLine,
+                ns.UI.bindsOnPickup(entry[1])) then
                 added = added + entry[6]
                 if recordKnown and recipeLearned(entry[2]) then
                     learnedThisRun[#learnedThisRun + 1] = { recipeID = entry[2], skillLine = skillLine }
@@ -256,7 +257,8 @@ function Craft.learnRecipes()
                     local fresh = countNew(db.recipes, outputItemID, recipeID)
                     local profName, skillLine, tradeSkillID = recipeProfession(recipeID)
                     if profName and skillLine then
-                        if Logic.addRecipe(db.recipes, outputItemID, recipeID, made, mats, name, profName, skillLine) then
+                        if Logic.addRecipe(db.recipes, outputItemID, recipeID, made, mats, name, profName, skillLine,
+                            ns.UI.bindsOnPickup(outputItemID)) then
                             added = added + fresh
                             if recordKnown and recipeLearned(recipeID) then
                                 learnedThisRun[#learnedThisRun + 1] = { recipeID = recipeID, skillLine = skillLine }

@@ -9,7 +9,7 @@ ns = ns or {}
 local L = {}
 ns.Logic = L
 
-L.VERSION = "0.15.0"
+L.VERSION = "0.15.1"
 -- Two independent version counters, mirroring the server (src/shared/scan-schema.ts SCAN_SCHEMA_VERSION,
 -- src/shared/ref-doc.ts REF_SCHEMA_VERSION): the scan document's shape (replicate, browse) has not changed
 -- since M1, so buildDoc still tags SCAN_SCHEMA; the reference document gained items, suffixes and named
@@ -637,13 +637,22 @@ end
 
 -- Files one recipe under its output item; seeing the same recipe again replaces it. name, professionName
 -- and skillLine (M2) are optional and ride along on the entry for refDoc to read; a recipe with none of
--- them yet is still filed here for this session's own Crafting Cost. -> true when stored.
-function L.addRecipe(book, outputItemID, recipeID, qty, mats, name, professionName, skillLine)
+-- them yet is still filed here for this session's own Crafting Cost. bop (roll briefs "B fix", addon
+-- 0.15.1) is the GAME's own answer for whether the output binds on pickup - true, false, or nil when the
+-- caller (Craft.lua, via UI.bindsOnPickup) does not yet know; nil is never stored as false. -> true when
+-- stored.
+function L.addRecipe(book, outputItemID, recipeID, qty, mats, name, professionName, skillLine, bop)
     if type(book) ~= "table" or not isCount(outputItemID, 1) or not isCount(recipeID, 1) then return false end
     if not isCount(qty, 1) or not validMats(mats) then return false end
     local copy = {}
     for i = 1, #mats do copy[i] = { mats[i][1], mats[i][2] } end
-    local entry = { recipeID = recipeID, qty = qty, mats = copy, name = name, profession = professionName, skillLine = skillLine }
+    -- NEVER "bop = (type(bop) == 'boolean') and bop or nil": Lua's and/or ternary collapses a real `false`
+    -- (a known-sellable output, exactly the answer this field exists to carry) into `nil` (unknown), because
+    -- `true and false` is itself `false`, which `or nil` then falls through - caught in review before this
+    -- shipped. An explicit if is the only safe way to store a boolean through this idiom.
+    local entry = { recipeID = recipeID, qty = qty, mats = copy, name = name, profession = professionName,
+        skillLine = skillLine }
+    if type(bop) == "boolean" then entry.bop = bop end
     local list = book[outputItemID]
     if type(list) ~= "table" then
         list = {}
@@ -1092,8 +1101,13 @@ function L.refDoc(db, at)
                 if validName(entry.name) and validName(entry.profession) then
                     local mats = {}
                     for m = 1, #entry.mats do mats[m] = { entry.mats[m][1], entry.mats[m][2] } end
-                    recipes[#recipes + 1] = { outputs[i], entry.recipeID, isCount(entry.qty, 1) and entry.qty or 1,
+                    local row = { outputs[i], entry.recipeID, isCount(entry.qty, 1) and entry.qty or 1,
                         mats, entry.name, entry.profession, isCount(entry.skillLine, 0) and entry.skillLine or 0 }
+                    -- Roll briefs "B fix": the 8th element rides along only when the game actually told us
+                    -- (true or false) - never sent at all when unknown, the same rule the suffix rows'
+                    -- optional 4th element (bonus lines) follows.
+                    if type(entry.bop) == "boolean" then row[8] = entry.bop end
+                    recipes[#recipes + 1] = row
                 end
             end
         end

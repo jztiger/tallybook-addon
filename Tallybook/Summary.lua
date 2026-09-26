@@ -28,6 +28,10 @@ local COLUMNS = {
     { "profit", "Profit", 454, 112, "RIGHT", "result" },
 }
 local WIDTH = 578
+-- Which columns show N crafts' worth rather than one (the 2026-09-26 UAT fix): plain multiplication of the
+-- per-craft figures Logic.profitSummary already computes, not a ladder walk (right-click a row for that,
+-- board card F13's own basket) - "listed" stays what is on the house right now regardless of N.
+local SCALED_COLUMNS = { cost = true, sale = true, profit = true }
 -- The profession tabs hang off the window's right edge (about 45 wide on this client): the panel starts past them.
 local CLEAR_OF_TABS = 52
 local GREEN, RED, GREY, CLOSE = "|cff00ff00", "|cffff2020", "|cff808080", "|r"
@@ -46,7 +50,11 @@ local function choices()
     return state
 end
 
-local crafts = 2 -- index into CRAFTS: 5 to start with
+-- Index into CRAFTS: one to start with (2026-09-26 UAT fix - was 5), now that the table itself follows this
+-- selection too: the tooltip's own Profit line is always the ONE-craft figure (fix round 1, I1's own rule,
+-- "the Profit in the tooltip is the Profit in the panel"), so the panel opening already scaled by 5 would
+-- have contradicted it on the very first look. The right-click basket still reaches every value in CRAFTS.
+local crafts = 1
 
 local function remember()
     ns.setSetting("list", ns.settings().list)
@@ -93,6 +101,20 @@ local function plural(n, one, many)
     return string.format("%.0f", n) .. " " .. (n == 1 and one or many)
 end
 
+-- " x10" beside a scaled column's header; nothing at the default of one craft.
+local function craftsSuffix(n)
+    return n == 1 and "" or (" x" .. string.format("%.0f", n))
+end
+
+-- What the panel says under the crafts button once it is showing more than one craft's worth (2026-09-26 UAT
+-- fix: the button used to size only the right-click basket, so the table never itself changed and read as
+-- broken). Empty at the default of one: the column headers need no gloss then, and Market value already
+-- marks a "(lowest now)" fallback figure on its own where that applies.
+local function craftsNoteText(n)
+    if n == 1 then return "" end
+    return string.format("x%.0f at lowest prices - right-click a row for the ladder walk", n)
+end
+
 local function countsText()
     local text = string.format("%.0f profitable, %.0f at a loss, %.0f unknown", counts.profit, counts.loss, counts.unknown)
     if (counts.bop or 0) > 0 then text = text .. string.format(", %.0f bind on pickup", counts.bop) end
@@ -104,7 +126,9 @@ end
 ---------------------------------------------------------------------------------------------------
 
 -- The open profession's recipes -> current (filtered, named, sorted) and counts (before "hide unknown").
-local function compute()
+-- n: how many crafts each row's cost/sale/profit are scaled to (the panel passes CRAFTS[crafts]; the chat
+-- fallback below always passes 1, since it has no button and no header to say what a bigger n would mean).
+local function compute(n)
     choices()
     current, counts = {}, { profit = 0, loss = 0, unknown = 0, bop = 0 }
     local T, db = C_TradeSkillUI, TallybookDB
@@ -139,9 +163,18 @@ local function compute()
     end
     local rows
     rows, counts = Logic.profitSummary(wanted, index, outputs, db.prices, db.vendor, db.listed, db.market, bound)
+    -- The crafts button (2026-09-26 UAT fix): scale each row's own cost/sale/profit to N crafts' worth
+    -- BEFORE sorting, so "sorted by profit" always means the scaled figure the column itself is showing.
+    -- counts (the summary line's profitable/at-a-loss/unknown/bop tallies) are read from `rows` above,
+    -- straight off Logic.profitSummary's own status field - never touched by this, and never scaled.
     for i = 1, #rows do
         local row = rows[i]
         row.name = names[row.recipeID] or ns.UI.itemName(row.itemID)
+        if n ~= 1 then
+            row.cost = row.cost * n
+            if row.sale then row.sale = row.sale * n end
+            if row.profit then row.profit = row.profit * n end
+        end
         if not (state.hideUnknown and row.status == "unknown") then current[#current + 1] = row end
     end
     Logic.sortSummary(current, state.key, state.descending)
@@ -244,8 +277,10 @@ local function paint()
 
     setText(panel.knownToggle, (state.knownOnly and "[x]" or "[ ]") .. " recipes I know only")
     setText(panel.unknownToggle, (state.hideUnknown and "[x]" or "[ ]") .. " hide unknown")
+    panel.craftsNote:SetText(craftsNoteText(CRAFTS[crafts]))
     for i = 1, #COLUMNS do
         local key, title = COLUMNS[i][1], COLUMNS[i][2]
+        if SCALED_COLUMNS[key] then title = title .. craftsSuffix(CRAFTS[crafts]) end
         if key == state.key then title = title .. (state.descending and " v" or " ^") end
         setText(panel.headers[key], title)
     end
@@ -322,13 +357,20 @@ local function build(parent)
     close:SetPoint("TOPRIGHT", p, "TOPRIGHT", -6, -6)
     setText(close, "x")
 
-    -- How many crafts a right-click on a row prices (the basket, board card F13).
+    -- How many crafts a right-click on a row prices (the basket, board card F13) AND, since the 2026-09-26
+    -- UAT fix, how many crafts' worth the table itself shows: the button used to size only the basket,
+    -- leaving the table looking broken since nothing about it ever changed - Summary.refresh() below is
+    -- the fix, the same re-read-and-redraw every other control on this panel already triggers on a change.
     p.craftsButton = textButton(p, 80, "RIGHT", function()
         crafts = crafts % #CRAFTS + 1
         setText(p.craftsButton, "crafts: " .. string.format("%.0f", CRAFTS[crafts]))
+        Summary.refresh()
     end)
     p.craftsButton:SetPoint("TOPRIGHT", p, "TOPRIGHT", -34, -6)
     setText(p.craftsButton, "crafts: " .. string.format("%.0f", CRAFTS[crafts]))
+    p.craftsNote = newLabel(p, "GameFontDisableSmall", "RIGHT")
+    p.craftsNote:SetWidth(220)
+    p.craftsNote:SetPoint("TOPRIGHT", p.craftsButton, "BOTTOMRIGHT", 0, -2)
 
     p.knownToggle = textButton(p, 170, "LEFT", function()
         state.knownOnly = not state.knownOnly
@@ -430,13 +472,14 @@ end
 -- once at the end, however many list events the game sent in between.
 function Summary.refresh()
     if not panel or not panel:IsShown() then return end
-    compute()
+    compute(CRAFTS[crafts])
     paint()
 end
 
--- The same summary as a few chat lines, for a client on which the panel cannot be built.
+-- The same summary as a few chat lines, for a client on which the panel cannot be built: always one craft's
+-- own figures, never scaled - there is no button and no column header here to say what a bigger N would mean.
 local function chatSummary()
-    compute()
+    compute(1)
     ns.print(professionName() .. ": " .. countsText())
     local shown = 0
     Logic.sortSummary(current, "profit", true)

@@ -279,6 +279,87 @@ local function finishReplicate(run, agg, n, unreadable, noLink)
     ns.pendingUpload = true -- 0.9.3: something is now waiting on a Sync / /tally reload to go out
 end
 
+-- Roll briefs, section B (addon 0.13.0), corrected by the "B fix" (UAT G9, 2026-09-26): which (itemID,
+-- suffixID) keys this Lua session has already tried a tooltip read for - marked even on a miss, so a roll
+-- with no green lines (or no tooltip API at all) is never asked again. A plain Lua local, not saved data:
+-- a session here means this running client, the same lifetime every other in-memory scan table in this
+-- file already has, and SavedVariables could not hold a throttle like this honestly anyway (write-only,
+-- C7's own rule).
+local bonusAttempted = {}
+
+-- Reads one auction's OWN item link via C_TooltipInfo.GetHyperlink - the fix for board card roll briefs
+-- section B / UAT G9: the owner's probes on Forever proved C_TooltipInfo.GetItemKey answers the grouped
+-- tooltip (no suffix stats at all), and GetHyperlink on a link with the suffix field stripped ignores the
+-- suffix too; only GetHyperlink on an INDIVIDUAL auction's own link returns its roll's own stat line
+-- ("+4 Agility"). Only reachable from the full-scan path (processReplicate), the one place a row's own
+-- link is ever in hand. Feature-detected like the API it replaces; only the green bonus-stat lines survive
+-- (Logic.filterBonusLines, via Logic.noteSuffixBonus), and only ever beside a suffix row that already has
+-- its name (noteSuffixBonus's own guard) - never a player name, never on a timer, at most once per
+-- (itemID, suffixID) per session.
+-- (itemID..":"..name) -> suffixID once resolved this session, or false once tried and not found - so a
+-- popular roll never re-scans db.suffixes on every one of its auctions. Cleared with every other in-memory
+-- scan table in this file (a plain Lua local): never saved, never read back.
+local resolvedSuffixByName = {}
+
+-- Roll briefs "B fix": which suffix id a full-scan row's own bonus id (variant) means, so its bonus lines can
+-- be filed under the SAME suffix row a browse scan already named. db.variants (board card B6's crosswalk,
+-- learned only from a player-driven browse, capped and gated on the server still lacking the pair) is tried
+-- first when it has an answer - but it starts empty every session and often stays sparse, so a second route
+-- exists: a full scan's own row hands over the roll's FULL SUFFIXED NAME (Ruling A/B above), which is the
+-- exact string noteBrowseNames already filed under db.suffixes[itemID..":"..suffixID] - and noteBrowseNames
+-- runs on EVERY browse, including the automatic one C7 fires once per auction house opening, so db.suffixes
+-- is filled far more reliably than db.variants ever is. Matching that name against this item's own suffix
+-- rows finds the same suffixID without needing the crosswalk at all. nil when neither route answers.
+local function resolveSuffixID(db, itemID, variant, name)
+    if type(db.variants) == "table" then
+        local viaVariant = db.variants[variant]
+        if viaVariant then return viaVariant end
+    end
+    if type(name) ~= "string" or name == "" then return nil end
+    local mapKey = itemID .. ":" .. name
+    local cached = resolvedSuffixByName[mapKey]
+    if cached ~= nil then
+        if cached == false then return nil end
+        return cached
+    end
+    local found = nil
+    if type(db.suffixes) == "table" then
+        for _, entry in pairs(db.suffixes) do
+            if type(entry) == "table" and entry[1] == itemID and entry[3] == name then
+                found = entry[2]
+                break
+            end
+        end
+    end
+    resolvedSuffixByName[mapKey] = found or false
+    return found
+end
+
+local function noteBonusLinesFromLink(db, itemID, suffixID, itemLink)
+    local mapKey = itemID .. ":" .. suffixID
+    if bonusAttempted[mapKey] then return end
+    bonusAttempted[mapKey] = true -- marked before the call: a throw or a miss is still one try spent
+    local getHyperlink = type(C_TooltipInfo) == "table" and C_TooltipInfo.GetHyperlink or nil
+    if type(getHyperlink) ~= "function" or type(itemLink) ~= "string" then return end
+    local ok, data = pcall(getHyperlink, itemLink)
+    if not ok or ns.isSecret(data) or type(data) ~= "table" or ns.isSecret(data.lines)
+        or type(data.lines) ~= "table" then
+        return
+    end
+    local raw = {}
+    for i = 1, #data.lines do
+        local line = data.lines[i]
+        if type(line) == "table" and not ns.isSecret(line.leftText) and type(line.leftText) == "string" then
+            local c = line.leftColor
+            local green = type(c) == "table" and not ns.isSecret(c.r) and not ns.isSecret(c.g)
+                and not ns.isSecret(c.b) and type(c.g) == "number" and type(c.r) == "number"
+                and type(c.b) == "number" and c.g > 0.5 and c.r < 0.5 and c.b < 0.5
+            if green then raw[#raw + 1] = line.leftText end
+        end
+    end
+    if #raw > 0 then Logic.noteSuffixBonus(db, itemID, suffixID, raw) end
+end
+
 local function processReplicate(run, n)
     run.processing = true
     local agg = Logic.newAggregator()
@@ -311,7 +392,10 @@ local function processReplicate(run, n)
     -- row's own name IS the base name, when hasAllInfo said the row was whole. A variant -> the row's name
     -- is the FULL suffixed name (Ruling A: never sent to noteSuffix - a full scan never calls it at all,
     -- since field 7 is empty on this client, board card B6) - so the base name is asked for separately.
-    local function noteRow(itemID, variant, name, qualityID, hasAllInfo)
+    -- Roll briefs "B fix" (UAT G9): a variant row also carries this auction's own item link, which is the
+    -- only place a roll's bonus stat line can be read, and this row's own name (once it is a real string,
+    -- never a secret value) - resolveSuffixID's second route into db.suffixes when db.variants has nothing.
+    local function noteRow(itemID, variant, name, qualityID, hasAllInfo, itemLink)
         if secret and secret(qualityID) then return end
         if variant == 0 then
             if not (secret and secret(hasAllInfo)) and hasAllInfo == true and not (secret and secret(name)) then
@@ -320,6 +404,12 @@ local function processReplicate(run, n)
         else
             local base = baseName(itemID)
             if base then Logic.noteItem(db, itemID, base, qualityID) end
+            local safeName = (not (secret and secret(name)) and type(name) == "string") and name or nil
+            local suffixID = resolveSuffixID(db, itemID, variant, safeName)
+            if suffixID and type(db.suffixes) == "table"
+                and db.suffixes[itemID .. ":" .. suffixID] ~= nil then
+                noteBonusLinesFromLink(db, itemID, suffixID, itemLink)
+            end
         end
     end
 
@@ -349,7 +439,7 @@ local function processReplicate(run, n)
                         if parseSuffix(itemLink) ~= 0 then agg.suffixSeen = agg.suffixSeen + 1 end
                         local variant = parseVariant(itemLink)
                         agg:add(itemID, variant, count, buyout, true)
-                        noteRow(itemID, variant, name, qualityID, hasAllInfo)
+                        noteRow(itemID, variant, name, qualityID, hasAllInfo, itemLink)
                     else
                         waiting[#waiting + 1] = { i, itemID, count, buyout, name, qualityID, hasAllInfo }
                     end
@@ -374,7 +464,7 @@ local function processReplicate(run, n)
                 if parseSuffix(itemLink) ~= 0 then agg.suffixSeen = agg.suffixSeen + 1 end
                 local variant = parseVariant(itemLink)
                 agg:add(row[2], variant, row[3], row[4], true)
-                noteRow(row[2], variant, row[5], row[6], row[7])
+                noteRow(row[2], variant, row[5], row[6], row[7], itemLink)
             else
                 noLink = noLink + 1
             end
@@ -582,50 +672,15 @@ local function namesKnown(db, key)
     return type(db.suffixes) == "table" and db.suffixes[key.itemID .. ":" .. key.itemSuffix] ~= nil
 end
 
--- Roll briefs, section B (addon 0.13.0): which (itemID, suffixID) keys this Lua session has already tried a
--- tooltip read for - marked even on a miss, so a roll with no green lines (or no tooltip API at all) is
--- never asked again. A plain Lua local, not saved data: a session here means this running client, the same
--- lifetime every other in-memory scan table in this file already has, and SavedVariables could not hold a
--- throttle like this honestly anyway (write-only, C7's own rule).
-local bonusAttempted = {}
-
--- Reads one suffixed roll's own tooltip via C_TooltipInfo.GetItemKey - the SAME key a browse result already
--- carries, so no item link is needed. Feature-detected: a client with no such function (or a Forever build
--- that changes its shape) simply teaches nothing here, same as any other optional API this addon reads.
--- Only the green bonus-stat lines are kept (Logic.filterBonusLines), and only ever beside a suffix row that
--- already has its name (Logic.noteSuffixBonus's own guard) - never a player name, never on a timer.
-local function noteBonusLines(db, key)
-    local mapKey = key.itemID .. ":" .. key.itemSuffix
-    if bonusAttempted[mapKey] then return end
-    bonusAttempted[mapKey] = true -- marked before the call: a throw or a miss is still one try spent
-    local getItemKey = type(C_TooltipInfo) == "table" and C_TooltipInfo.GetItemKey or nil
-    if type(getItemKey) ~= "function" or not isCountLike(key.itemLevel) then return end
-    local ok, data = pcall(getItemKey, key.itemID, key.itemLevel, key.itemSuffix)
-    if not ok or ns.isSecret(data) or type(data) ~= "table" or ns.isSecret(data.lines)
-        or type(data.lines) ~= "table" then
-        return
-    end
-    local raw = {}
-    for i = 1, #data.lines do
-        local line = data.lines[i]
-        if type(line) == "table" and not ns.isSecret(line.leftText) and type(line.leftText) == "string" then
-            local c = line.leftColor
-            local green = type(c) == "table" and not ns.isSecret(c.r) and not ns.isSecret(c.g)
-                and not ns.isSecret(c.b) and type(c.g) == "number" and type(c.r) == "number"
-                and type(c.b) == "number" and c.g > 0.5 and c.r < 0.5 and c.b < 0.5
-            if green then raw[#raw + 1] = line.leftText end
-        end
-    end
-    if #raw > 0 then Logic.noteSuffixBonus(db, key.itemID, key.itemSuffix, raw) end
-end
-
 -- M2 (Ruling A/B): for each result's itemKey, GetItemKeyInfo answers itemName and quality once the client
 -- has cached the key - or nil until ITEM_KEY_ITEM_INFO_RECEIVED, in which case this result is skipped and
 -- a later scan sees it (no new event handler for this). itemSuffix 0 IS the base item: straight to
 -- noteItem. A non-zero itemSuffix is the FULL suffixed name, to noteSuffix; its base name is a separate,
 -- memoized lookup (the item template), because a suffixed key's own itemName is never the unsuffixed one.
--- Roll briefs section B: a suffixed key whose bonus has not been tried this session still reaches
--- noteBonusLines below even once its names are fully known - namesKnown alone would skip it for good.
+-- Roll bonus lines are NOT learned here any more (roll briefs "B fix", UAT G9): the owner's probes on
+-- Forever showed C_TooltipInfo.GetItemKey answers the grouped tooltip for a browse key, with no stats at
+-- all - the full-scan path below, which has each auction's own link, is the only place a roll's bonus can
+-- actually be read.
 local function noteBrowseNames(results)
     local getKeyInfo = C_AuctionHouse.GetItemKeyInfo
     if type(getKeyInfo) ~= "function" then return end
@@ -648,10 +703,6 @@ local function noteBrowseNames(results)
                         Logic.noteItem(db, key.itemID, info.itemName, info.quality)
                     end
                 end
-            end
-            if key.itemSuffix ~= 0 and type(db.suffixes) == "table"
-                and db.suffixes[key.itemID .. ":" .. key.itemSuffix] ~= nil then
-                noteBonusLines(db, key)
             end
         end
     end
